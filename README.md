@@ -1,21 +1,165 @@
-# Planetary Interior Framework: Fuzzy Cores & Sub-Neptunes
+# 🪐 fuzzycore: Planetary Interior Framework
 
-This repository contains the Python-based numerical framework developed to solve the equations of hydrostatic equilibrium for multi-phase planetary interiors. It is designed to rigorously map the structural degeneracies between solid cores, volatile water mantles, and deeply suspended dilute "fuzzy" gradients.
+This repository contains the Python-based numerical framework developed to solve the equations of hydrostatic equilibrium for multi-phase planetary interiors. It is explicitly designed to rigorously map the structural degeneracies between compact solid cores, volatile water mantles, and deeply suspended dilute "fuzzy" composition gradients.
 
-This framework is built for robustness, explicitly handling severe thermodynamic discontinuities (such as liquid-vapor phase transitions) and adaptive atmospheric downsampling, making it capable of modelling both dense water-worlds (e.g., GJ 1214 b) and highly inflated super-puffs (e.g., Kepler-11e).
+This framework is built for robustness, explicitly handling severe thermodynamic discontinuities (such as liquid-vapor phase transitions) and adaptive atmospheric downsampling, making it capable of modeling both dense water-worlds (e.g., GJ 1214 b) and highly inflated super-puffs (e.g., Kepler-11e) within a single unified tool.
 
 **Primary Reference:**
-If you use this code in your research, please cite our corresponding *Astronomy & Astrophysics* paper (in prep.) :
-> Wilkinson, C., Mazevet, S., Lagrange, A.-M., Charnay, B. (2026). *A robust numerical framework for giant planet interior modeling: Constraining the core-envelope equivalence in the presence of dilute gradients.* A&A. (in prep. )
+If you use this code in your research, please cite our corresponding *Astronomy & Astrophysics* paper:
+> Wilkinson, C., Mazevet, S., Lagrange, A.-M., Charnay, B. (2026). *A robust numerical framework for giant planet interior modeling: Constraining the core-envelope equivalence in the presence of dilute gradients.* A&A.
 
 ---
 
-## 📂 Project Structure
+## ⚙️ Installation & Requirements
 
-```text
-planetary_interior/
-├── data/               # Equation of State (EOS) tables (ANEOS, AQUA, Chabrier)
-├── figures/            # Output directory for generated plots
-├── notebooks/          # Jupyter notebooks for exploratory analysis
-├── scripts/            # Executable scripts for parameter sweeps and modeling
-└── src/                # Core physics, solver, and EOS interpolation modules
+This framework relies on standard scientific Python libraries. We recommend using `conda` or a standard virtual environment.
+
+```bash
+# Clone the repository
+git clone [https://github.com/ChristianSWilkinson/fuzzycore.git](https://github.com/ChristianSWilkinson/fuzzycore.git)
+cd fuzzycore
+
+# Create a new environment
+conda create -n fuzzy_env python=3.10
+conda activate fuzzy_env
+
+# Install required packages
+pip install -r requirements.txt
+```
+
+---
+
+## 🚀 The Planet Builder's Guide
+
+The heart of `fuzzycore` is the `solve_structure()` function. By simply altering the `params` dictionary, the solver will dynamically switch its internal physics architecture to build whatever class of planet you request.
+
+### 1. Understanding the `params` Dictionary
+Every planet requires these base parameters:
+* `M_core` / `M_rock`: Mass of the solid interior (in kg).
+* `M_water`: Mass of the water mantle (in kg). **Set to `0.0` for a gas giant.**
+* `iron_fraction`: Mass fraction of iron in the core (e.g., `0.33` for Earth-like).
+* `P_surf`: Atmospheric pressure boundary (in bar).
+* `T_surf`: Atmospheric temperature boundary (in K).
+* `z_base`: The baseline metallicity of the upper atmosphere.
+* `z_profile`: An array of discrete composition steps for the integrator to use.
+* `sigma_val`: The width of the compositional gradient (`0.01` = Sharp, `0.30` = Fuzzy).
+
+---
+
+### Recipe A: A Standard Gas Giant (Sharp Core)
+To build a standard sub-Neptune with a distinct, sharp boundary between a solid rock core and a fully convective gaseous envelope, set `M_water = 0.0` and `sigma_val = 0.01`.
+
+```python
+import numpy as np
+from src import solver, utils
+from src import constants as c
+
+target_mass = 8.0 * c.M_EARTH
+
+params = {
+    'M_core': 7.0 * c.M_EARTH,   # 7 Earth-mass solid core
+    'M_water': 0.0,              # No water layer
+    'iron_fraction': 0.33,       
+    'P_surf': 1.0,               # 1 bar surface
+    'T_surf': 500.0,             
+    'z_base': 0.05,              # 5% atmospheric metallicity
+    'z_profile': np.linspace(0.05, 1.0, 20),
+    'sigma_val': 0.01,           # Sharp core-envelope boundary!
+    'debug': True
+}
+
+# Run the integrator
+result = solver.solve_structure(
+    target_val=target_mass,
+    params=params,
+    mode='mass',
+    trial_id="standard_gas_giant",
+    csv_file="temp.csv",
+    write_lock=utils.DummyLock()
+)
+```
+
+---
+
+### Recipe B: A Dense Water World (e.g., GJ 1214 b)
+To build an ocean world or a planet with a massive supercritical water mantle beneath a thin atmosphere, simply provide a non-zero `M_water`. The solver will automatically utilize the ab-initio water tables and nest the boundary-shooting algorithms.
+
+```python
+params = {
+    'M_rock': 7.0 * c.M_EARTH,   # Note: use 'M_rock' instead of 'M_core'
+    'M_water': 1.0 * c.M_EARTH,  # 1 Earth-mass water mantle!
+    'iron_fraction': 0.33,
+    'P_surf': 1.0,
+    'T_surf': 500.0,
+    'z_base': 0.05,
+    'z_profile': np.linspace(0.05, 1.0, 20),
+    'sigma_val': 0.01,
+}
+```
+
+---
+
+### Recipe C: A "Fuzzy Core" Super-Puff (e.g., Kepler-11e)
+To simulate the massive radius inflation caused by heavy elements lofted into the gaseous envelope, shrink the solid `M_core` and increase `sigma_val`. The discrete entropy jumps will act as a deep thermal blanket, puffing out the planet.
+
+```python
+params = {
+    'M_core': 2.0 * c.M_EARTH,   # Tiny solid core
+    'M_water': 0.0,              
+    'iron_fraction': 0.33,
+    'P_surf': 10.0,              # Evaluate deeper at the convective boundary
+    'T_surf': 1200.0,            # High internal heat
+    'z_base': 0.05,
+    'z_profile': np.linspace(0.05, 1.0, 20),
+    'sigma_val': 0.30,           # Wide compositional gradient!
+}
+```
+
+---
+
+## 🏃‍♂️ Included Execution Scripts
+
+We have provided three ready-to-run scripts in the `scripts/` directory that reproduce the key analyses from our paper. 
+
+### 1. Kepler-11e Structural Sweep (`run_kepler11e_parallel.py`)
+This script runs a parallelized 1D parameter sweep, systematically shifting mass from a solid rock core into a suspended dilute envelope while maintaining a constant total planetary mass. It outputs a curve proving how structural radii monotonically inflate purely via hydrostatic metal redistribution.
+
+```bash
+python scripts/run_kepler11e_parallel.py
+```
+
+### 2. Thermal Blanketing Analysis (`run_tint_amplification.py`)
+This script evaluates four distinct configurations (Sharp vs. Fuzzy cores under Hot vs. Cold internal states). It demonstrates the non-linear "amplification" effect, proving that a fuzzy core inflates a planet by a factor of 3x greater than a fully convective equivalent when subjected to the same internal heat.
+
+```bash
+python scripts/run_tint_amplification.py
+```
+
+### 3. Mass-Temperature Equivalence Grid (`run_planet_grid.py`)
+A heavy-duty script utilizing Python's `multiprocessing` pool to map the deep 3x3 structural degeneracy grid across variations in total planetary mass (0.3, 1.0, 5.0 M_J) and surface temperature. It incorporates robust checkpointing (`grid_sweep_results.csv`) so you can pause and resume execution seamlessly.
+
+```bash
+python scripts/run_planet_grid.py
+```
+
+---
+
+## 📊 Plotting Results
+Once a model successfully converges, it returns a dictionary of 1D arrays (`R`, `M`, `P`, `T`, `Rho`, `S`, `Z`). You can immediately visualize the internal architecture using our built-in PEP 8 compliant plotting suite:
+
+```python
+from src import plotting
+
+# Plot internal density, temperature, and entropy profiles
+plotting.plot_diagnostics(result, save_name="my_planet_structure")
+
+# Plot the planet's trajectory across the thermodynamic phase space
+plotting.plot_trajectory_on_eos(result, params, save_name="my_planet_eos")
+```
+
+---
+
+## 🔬 Core Physical Features
+* **Nested Boundary-Shooting:** Decouples highly compressible atmospheres from incompressible cores to ensure absolute mass conservation across arbitrary phase boundaries.
+* **KD-Tree Adiabat Stepper:** Uses multidimensional local linear regressions over 3D (P, T, S) phase spaces to integrate continuous fluid adiabats.
+* **Isothermal Phase Guards:** Enforces strict thermodynamic monotonicity to bridge jagged low-pressure vapor-liquid phase transitions (e.g., 1–1000 bar) in ab-initio water tables.
