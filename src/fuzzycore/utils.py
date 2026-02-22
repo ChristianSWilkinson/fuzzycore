@@ -19,23 +19,31 @@ def generate_gaussian_z_profile(
     Generates a heavy element (Z) mass fraction profile following a Gaussian decay.
     
     This function creates a discrete 1D array representing the transition from a 
-    metal-rich core boundary out to a metal-poor atmospheric baseline.
+    metal-rich core boundary out to a metal-poor atmospheric baseline. If `sigma` 
+    is set to 0.0 or None, it acts as a toggle to return a single-layer profile, 
+    triggering the solver to model a purely adiabatic (fully convective) envelope.
     
     Args:
         n_layers (int, optional): Number of discrete steps/layers in the envelope. 
             Defaults to 25.
         sigma (float, optional): 'Width' of the compositional transition. Smaller 
             values (e.g., 0.1) create a sharp boundary; larger values (e.g., 0.3) 
-            create a highly diffuse "fuzzy" core. Defaults to 0.15.
+            create a highly diffuse "fuzzy" core. If `<= 0.0` or `None`, triggers 
+            a purely adiabatic well-mixed envelope. Defaults to 0.15.
         z_base (float, optional): The baseline Z mass fraction at the atmospheric 
             surface. Defaults to 0.02.
         z_core (float, optional): The maximum Z mass fraction at the inner 
             core-envelope interface. Defaults to 0.98.
             
     Returns:
-        np.ndarray: A 1D array of length `n_layers` containing the Z fraction 
-            for each layer, safely clipped between [0.0, 0.99].
+        np.ndarray: A 1D array containing the Z fraction for each layer, safely 
+            clipped between [0.0, 0.99]. If `sigma` <= 0, returns a single-element 
+            array `[z_base]`.
     """
+    # Trigger for purely adiabatic / well-mixed envelope
+    if sigma is None or sigma <= 0.0:
+        return np.array([z_base])
+        
     # Spatial domain: x goes from 0 (surface) to 1 (core interface)
     x = np.linspace(0, 1, n_layers)
     
@@ -43,7 +51,7 @@ def generate_gaussian_z_profile(
     # This means raw_z decays as it moves outwards toward the surface (x = 0.0)
     raw_z = np.exp(-((x - 1.0) ** 2) / (2 * sigma ** 2))
     
-    # Normalize the raw Gaussian so it spans exactly [0, 1] before applying physical bounds
+    # Normalize the raw Gaussian so it spans exactly [0, 1] before applying bounds
     raw_z = (raw_z - raw_z.min()) / (raw_z.max() - raw_z.min())
     
     # Scale and shift the normalized curve to fit between the atmospheric 
