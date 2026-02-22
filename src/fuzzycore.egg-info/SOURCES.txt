@@ -1,0 +1,14 @@
+README.md
+setup.py
+src/fuzzycore/__init__.py
+src/fuzzycore/constants.py
+src/fuzzycore/eos.py
+src/fuzzycore/physics.py
+src/fuzzycore/plotting.py
+src/fuzzycore/solver.py
+src/fuzzycore/utils.py
+src/fuzzycore.egg-info/PKG-INFO
+src/fuzzycore.egg-info/SOURCES.txt
+src/fuzzycore.egg-info/dependency_links.txt
+src/fuzzycore.egg-info/requires.txt
+src/fuzzycore.egg-info/top_level.txt
