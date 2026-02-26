@@ -7,6 +7,7 @@ locks during structural parameter sweeps.
 """
 
 import numpy as np
+from . import constants as c
 
 
 def generate_gaussian_z_profile(
@@ -143,3 +144,69 @@ class DummyLock:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit the runtime context without needing to release anything."""
         pass
+
+
+def calculate_staircase_dt_ds(results: dict, t_int: float) -> dict:
+    """
+    Calculates the inverse cooling rate (dt/dS) for a non-adiabatic staircase model.
+    
+    This function expands the thermal integral by grouping the interior into 
+    discrete compositional (Z) layers. It returns both the global homologous 
+    cooling rate and a breakdown of how much thermal inertia is contributed 
+    by each specific layer in the dilute core.
+    
+    Args:
+        results (dict): The converged planetary structure dictionary returned 
+            by the solver (must contain 'R', 'T', 'Rho', and 'Z' arrays).
+        t_int (float): The internal effective temperature driving the cooling 
+            luminosity (in Kelvin).
+            
+    Returns:
+        dict: A dictionary containing:
+            - 'total_dt_ds' (float): The global inverse cooling rate.
+            - 'layer_contributions' (dict): A mapping of Z-fraction to its 
+              specific contribution to dt/dS.
+    """
+    R = results['R']
+    T = results['T']
+    Rho = results['Rho']
+    Z = results['Z']
+    
+    R_p = R[-1]
+    
+    # Calculate the Stefan-Boltzmann denominator (Luminosity / 4*pi)
+    denominator = c.SIGMA_SB * (R_p ** 2) * (t_int ** 4)
+    
+    if denominator <= 0:
+        return {'total_dt_ds': np.inf, 'layer_contributions': {}}
+        
+    # Calculate radial step sizes
+    dr = np.diff(R)
+    
+    # Evaluate the base integrand: T(r) * rho(r) * r^2
+    integrand = T[:-1] * Rho[:-1] * (R[:-1] ** 2)
+    
+    # Find all unique compositional steps in the staircase
+    unique_z = np.unique(Z)
+    
+    layer_contributions = {}
+    total_dt_ds = 0.0
+    
+    # Integrate layer-by-layer
+    for z_val in unique_z:
+        # Create a boolean mask for the current compositional layer
+        # (using np.isclose to handle any floating-point rounding variations)
+        mask = np.isclose(Z[:-1], z_val, atol=1e-4)
+        
+        # Integrate only within the physical boundaries of this specific layer
+        layer_integral = np.sum(integrand[mask] * dr[mask])
+        layer_dt_ds = layer_integral / denominator
+        
+        # Store the contribution
+        layer_contributions[z_val] = layer_dt_ds
+        total_dt_ds += layer_dt_ds
+        
+    return {
+        'total_dt_ds': total_dt_ds,
+        'layer_contributions': layer_contributions
+    }

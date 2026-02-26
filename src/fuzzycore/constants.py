@@ -27,6 +27,9 @@ M_JUPITER: float = 1.898e27
 # Equatorial radius of Jupiter (Units: m)
 R_JUPITER: float = 71492000.0
 
+# Stefan-Boltzmann constant (Units: W m^-2 K^-4)
+SIGMA_SB: float = 5.670374419e-8
+
 
 # =============================================================================
 # UNIT CONVERSIONS
