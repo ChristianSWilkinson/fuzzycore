@@ -11,8 +11,7 @@ env/
 
 # Data and Outputs (Modify if you want to push small sample data)
 # It is best practice to ignore massive EOS tables and generated plots
-data/
-data/EOS/*
+data/*.csv
 figures/*.pdf
 figures/*.png
 
