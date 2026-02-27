@@ -4,7 +4,19 @@ import pandas as pd
 import scipy.spatial
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 from scipy.spatial import cKDTree
+from pathlib import Path
+
 from . import constants as const
+
+# =============================================================================
+# ABSOLUTE PATH RESOLUTION
+# =============================================================================
+# __file__ gets the absolute path to this exact eos.py file.
+# .resolve() resolves any symlinks.
+# .parents[2] navigates up 3 levels: fuzzycore/src/fuzzycore/eos.py -> fuzzycore/
+FUZZYCORE_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = FUZZYCORE_ROOT / "data" / "EOS"
+
 
 # =============================================================================
 # GLOBAL CACHE
@@ -77,7 +89,7 @@ def _load_raw_table(name: str, path: str, cols: list, log_cols: bool = False) ->
         return None
 
 
-def load_all_raw_data(base_dir: str = "../data/EOS") -> dict:
+def load_all_raw_data(base_dir: str = str(DATA_DIR)) -> dict:
     """
     Central function to load all fundamental EOS tables (H, He, H2O, Rock, Iron) 
     into memory. Only loads from disk on the first invocation.
@@ -85,7 +97,7 @@ def load_all_raw_data(base_dir: str = "../data/EOS") -> dict:
     Parameters
     ----------
     base_dir : str, optional
-        The root directory containing the EOS data files (default is "../data/EOS").
+        The root directory containing the EOS data files.
 
     Returns
     -------
@@ -101,8 +113,8 @@ def load_all_raw_data(base_dir: str = "../data/EOS") -> dict:
     print("--- Loading Raw EOS Tables (From Disk) ---")
 
     # Define absolute/relative paths based on the base_dir
-    h_path = os.path.join(base_dir, "DirEOS2021/TABLE_H_TP_v1")
-    he_path = os.path.join(base_dir, "DirEOS2021/TABLE_HE_TP_v1")
+    h_path = os.path.join(base_dir, "DirEOS2021", "TABLE_H_TP_v1")
+    he_path = os.path.join(base_dir, "DirEOS2021", "TABLE_HE_TP_v1")
     h2o_path = os.path.join(base_dir, "h2o-abinitio.dat")
     rock_path = os.path.join(base_dir, "aneosRock.dat")
     iron_path = os.path.join(base_dir, "aneosIron.dat")
@@ -193,25 +205,12 @@ def load_all_raw_data(base_dir: str = "../data/EOS") -> dict:
 # INTERPOLATORS
 # =============================================================================
 
+
 def interpolate_table(grid_points: np.ndarray, values: np.ndarray, query_points: np.ndarray) -> np.ndarray:
     """
     Interpolates scattered 2D EOS data (P, T) using a Delaunay triangulation 
     (LinearNDInterpolator). Implements a robust fallback to Nearest-Neighbor 
     interpolation for points queried just outside the defined convex hull.
-
-    Parameters
-    ----------
-    grid_points : np.ndarray
-        Array of shape (N, 2) containing the known (logP, logT) coordinates.
-    values : np.ndarray
-        Array of shape (N,) containing the scalar values to interpolate (e.g., Density).
-    query_points : np.ndarray
-        Array of shape (M, 2) containing the target (logP, logT) coordinates.
-
-    Returns
-    -------
-    np.ndarray
-        Interpolated values at the requested query_points.
     """
     lin_interp = LinearNDInterpolator(grid_points, values, rescale=True)
     result = lin_interp(query_points)
@@ -230,23 +229,9 @@ def interpolate_table(grid_points: np.ndarray, values: np.ndarray, query_points:
 # CORE MIXER (Iron + Silicate Rock)
 # =============================================================================
 
-def get_core_interpolator(iron_fraction: float = 0.33, base_dir: str = "../../data/EOS") -> LinearNDInterpolator:
+def get_core_interpolator(iron_fraction: float = 0.33, base_dir: str = str(DATA_DIR)) -> LinearNDInterpolator:
     """
     Constructs an additive volume mixing interpolator for a condensed solid core.
-
-    Parameters
-    ----------
-    iron_fraction : float, optional
-        Mass fraction of iron in the core. Must be between 0.0 and 1.0. 
-        (default is 0.33 for Earth-like bulk composition).
-    base_dir : str, optional
-        Path to the root directory containing EOS data.
-
-    Returns
-    -------
-    LinearNDInterpolator
-        A callable 2D interpolator object predicting log(Density) given 
-        (log_Pressure, log_Temperature). Returns None if base tables are missing.
     """
     global _CORE_CACHE, _ROCK_BOUNDS
     
@@ -292,7 +277,7 @@ def get_core_interpolator(iron_fraction: float = 0.33, base_dir: str = "../../da
     return interp
 
 
-def get_rock_interpolator(base_dir: str = "../data/EOS") -> LinearNDInterpolator:
+def get_rock_interpolator(base_dir: str = str(DATA_DIR)) -> LinearNDInterpolator:
     """Legacy wrapper function. Returns a core interpolator with 0% Iron (Pure Rock)."""
     return get_core_interpolator(iron_fraction=0.0, base_dir=base_dir)
 
@@ -300,20 +285,6 @@ def get_rock_interpolator(base_dir: str = "../data/EOS") -> LinearNDInterpolator
 def query_core_eos(log_p: float, log_t: float, iron_fraction: float = 0.33) -> float:
     """
     Safely queries the mixed core interpolator with boundary guards.
-
-    Parameters
-    ----------
-    log_p : float
-        Base-10 logarithm of pressure (in bar).
-    log_t : float
-        Base-10 logarithm of temperature (in K).
-    iron_fraction : float, optional
-        Mass fraction of iron (default 0.33).
-
-    Returns
-    -------
-    float
-        Base-10 logarithm of the resultant core density (kg/m^3).
     """
     interp = get_core_interpolator(iron_fraction)
     # Absolute failure fallback
@@ -343,15 +314,9 @@ def query_rock_eos(log_p: float, log_t: float) -> float:
 # DIRECT WATER EOS
 # =============================================================================
 
-def get_water_interpolators_complete(base_dir: str = "../data/EOS") -> dict:
+def get_water_interpolators_complete(base_dir: str = str(DATA_DIR)) -> dict:
     """
     Builds direct 2D interpolators for high-pressure water/ice phases.
-
-    Returns
-    -------
-    dict
-        A dictionary containing interpolators for Density ('rho') and Entropy ('S'),
-        along with the raw underlying data points.
     """
     global _WATER_INTERP
     if _WATER_INTERP:
@@ -386,22 +351,10 @@ def get_water_interpolators_complete(base_dir: str = "../data/EOS") -> dict:
 # FLUID MIXING (Hydrogen + Helium + Heavy Elements)
 # =============================================================================
 
-def get_mix_table(z_val: float, base_dir: str = "../data/EOS") -> np.ndarray:
+def get_mix_table(z_val: float, base_dir: str = str(DATA_DIR)) -> np.ndarray:
     """
     Generates a blended (H/He/Z) fluid table based on a specific metallicity fraction.
     The H/He ratio is maintained at the solar proto-stellar value (Y / X ≈ 0.26 / 0.74).
-
-    Parameters
-    ----------
-    z_val : float
-        Mass fraction of heavy elements (metals/volatiles) in the fluid layer.
-    base_dir : str, optional
-        Directory containing the source EOS tables.
-
-    Returns
-    -------
-    np.ndarray
-        A structured array containing [logP, logT, logRho, Entropy] for the mixed fluid.
     """
     if z_val in _MIXED_CACHE:
         return _MIXED_CACHE[z_val]
@@ -460,23 +413,10 @@ def get_mix_table(z_val: float, base_dir: str = "../data/EOS") -> np.ndarray:
     return mixed_data
 
 
-def generate_fluid_interpolators(z_profile: np.ndarray, base_dir: str = "../../data/EOS") -> dict:
+def generate_fluid_interpolators(z_profile: np.ndarray, base_dir: str = str(DATA_DIR)) -> dict:
     """
     Pre-computes and caches 2D interpolators for every unique metallicity step 
     in the planetary envelope's 'staircase' gradient.
-
-    Parameters
-    ----------
-    z_profile : np.ndarray
-        An array containing the discrete heavy element mass fractions ($Z$) for each layer.
-    base_dir : str, optional
-        Data directory location.
-
-    Returns
-    -------
-    dict
-        A dictionary mapping each unique $Z$ value to its corresponding 
-        density and entropy interpolators.
     """
     unique_z = np.unique(z_profile)
     stack = {}
@@ -519,12 +459,6 @@ class RobustAdiabatStepper:
     def __init__(self, layer_data: dict):
         """
         Initializes the stepper with the thermodynamic data of a specific Z-layer.
-        
-        Parameters
-        ----------
-        layer_data : dict
-            The output dictionary generated by `generate_fluid_interpolators` 
-            for a specific metallicity.
         """
         self.points = layer_data['points']
         self.rho_interp = layer_data['rho']
@@ -538,20 +472,6 @@ class RobustAdiabatStepper:
         """
         Calculates the thermodynamic state (T, Rho) at a new pressure step 
         while enforcing an adiabatic (constant entropy) constraint.
-
-        Parameters
-        ----------
-        p_log_target : float
-            The destination pressure in log10(bar).
-        t_log_guess : float
-            An initial guess for the temperature in log10(K).
-        s_target : float
-            The required entropy value to maintain the adiabat.
-
-        Returns
-        -------
-        tuple of (float, float)
-            The converged (log10(Temperature), log10(Density)).
         """
         # 1. Fetch the 10 closest physical points in the local (P, T) phase space
         d, idxs = self.tree.query([p_log_target, t_log_guess], k=10)
@@ -579,9 +499,6 @@ class RobustAdiabatStepper:
             b = 0
 
         # 3. Root Finding
-        # If the derivative wrt Temperature (b) is virtually flat, the local 
-        # phase space is unstable (e.g., inside a phase transition zone). 
-        # We invoke an isothermal guard.
         if abs(b) < 1e-5:
             t_pred = t_log_guess
         else:
@@ -589,7 +506,6 @@ class RobustAdiabatStepper:
             t_pred = t_m + (s_target - s_m - a * (p_log_target - p_m)) / b
 
         # 4. Enforce Physical Clamping
-        # Prevent the algorithm from wildly over-extrapolating out of the local cell
         t_min, t_max = np.min(nb_t), np.max(nb_t)
         t_pred = np.clip(t_pred, t_min - 0.5, t_max + 0.5)
 
