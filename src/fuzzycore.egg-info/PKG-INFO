@@ -39,22 +39,40 @@ If you use this code in your research, please cite our corresponding *Astronomy 
 
 ---
 
+## 📂 Project Structure
+
+```text
+fuzzycore/
+├── data/               # Equation of State (EOS) tables (ANEOS, AQUA, Chabrier)
+├── figures/            # Output directory for generated plots
+├── notebooks/          # Jupyter notebooks for exploratory analysis
+├── scripts/            # Executable scripts for parameter sweeps and modeling
+├── setup.py            # Package installation configuration
+├── requirements.txt    # Python dependencies
+└── src/
+    └── fuzzycore/      # Core framework modules (physics.py, solver.py, eos.py, etc.)
+```
+
+---
+
 ## ⚙️ Installation & Requirements
 
-This framework relies on standard scientific Python libraries. We recommend using `conda` or a standard virtual environment.
+This framework relies on standard scientific Python libraries and is designed to be installed as a global package within your environment.
 
 ```bash
-# Clone the repository
+# 1. Clone the repository
 git clone [https://github.com/ChristianSWilkinson/fuzzycore.git](https://github.com/ChristianSWilkinson/fuzzycore.git)
 cd fuzzycore
 
-# Create a new environment
+# 2. Create and activate a new virtual environment
 conda create -n fuzzy_env python=3.10
 conda activate fuzzy_env
 
-# Install required packages
+# 3. Install dependencies and the package in editable mode
 pip install -r requirements.txt
+pip install -e .
 ```
+*(Installing with `-e .` allows you to import `fuzzycore` from anywhere on your machine while instantly reflecting any changes you make to the source code).*
 
 ---
 
@@ -80,8 +98,9 @@ To build a standard sub-Neptune with a distinct, sharp boundary between a solid 
 
 ```python
 import numpy as np
-from src import solver, utils
-from src import constants as c
+import fuzzycore.constants as c
+import fuzzycore.solver as solver
+import fuzzycore.utils as utils
 
 target_mass = 8.0 * c.M_EARTH
 
@@ -148,24 +167,24 @@ params = {
 
 ## 🏃‍♂️ Included Execution Scripts
 
-We have provided three ready-to-run scripts in the `scripts/` directory that reproduce the key analyses from our paper. 
+We have provided three ready-to-run scripts in the `scripts/` directory that reproduce the key analyses from our paper. *Note: run these from the root repository directory.*
 
 ### 1. Kepler-11e Structural Sweep (`run_kepler11e_parallel.py`)
-This script runs a parallelized 1D parameter sweep, systematically shifting mass from a solid rock core into a suspended dilute envelope while maintaining a constant total planetary mass. It outputs a curve proving how structural radii monotonically inflate purely via hydrostatic metal redistribution.
+This script runs a parallelized 1D parameter sweep, systematically shifting mass from a solid rock core into a suspended dilute envelope while maintaining a constant total planetary mass. 
 
 ```bash
 python scripts/run_kepler11e_parallel.py
 ```
 
 ### 2. Thermal Blanketing Analysis (`run_tint_amplification.py`)
-This script evaluates four distinct configurations (Sharp vs. Fuzzy cores under Hot vs. Cold internal states). It demonstrates the non-linear "amplification" effect, proving that a fuzzy core inflates a planet by a factor of 3x greater than a fully convective equivalent when subjected to the same internal heat.
+This script evaluates four distinct configurations (Sharp vs. Fuzzy cores under Hot vs. Cold internal states). It demonstrates the non-linear "amplification" effect of dilute cores.
 
 ```bash
 python scripts/run_tint_amplification.py
 ```
 
 ### 3. Mass-Temperature Equivalence Grid (`run_planet_grid.py`)
-A heavy-duty script utilizing Python's `multiprocessing` pool to map the deep 3x3 structural degeneracy grid across variations in total planetary mass (0.3, 1.0, 5.0 M_J) and surface temperature. It incorporates robust checkpointing (`grid_sweep_results.csv`) so you can pause and resume execution seamlessly.
+A heavy-duty script utilizing Python's `multiprocessing` pool to map the deep 3x3 structural degeneracy grid across variations in total planetary mass and surface temperature.
 
 ```bash
 python scripts/run_planet_grid.py
@@ -177,7 +196,7 @@ python scripts/run_planet_grid.py
 Once a model successfully converges, it returns a dictionary of 1D arrays (`R`, `M`, `P`, `T`, `Rho`, `S`, `Z`). You can immediately visualize the internal architecture using our built-in PEP 8 compliant plotting suite:
 
 ```python
-from src import plotting
+import fuzzycore.plotting as plotting
 
 # Plot internal density, temperature, and entropy profiles
 plotting.plot_diagnostics(result, save_name="my_planet_structure")

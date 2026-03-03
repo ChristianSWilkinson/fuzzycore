@@ -351,78 +351,65 @@ def get_water_interpolators_complete(base_dir: str = str(DATA_DIR)) -> dict:
 # FLUID MIXING (Hydrogen + Helium + Heavy Elements)
 # =============================================================================
 
-def get_mix_table(z_val: float, base_dir: str = str(DATA_DIR)) -> np.ndarray:
+def get_mix_table(z_val: float, y_ratio: float = 0.26, base_dir: str = str(DATA_DIR)) -> np.ndarray:
     """
-    Generates a blended (H/He/Z) fluid table based on a specific metallicity fraction.
-    The H/He ratio is maintained at the solar proto-stellar value (Y / X ≈ 0.26 / 0.74).
+    Generates a blended (H/He/Z) fluid table.
+    The H/He mass ratio is dynamically piloted by the y_ratio parameter.
     """
-    if z_val in _MIXED_CACHE:
-        return _MIXED_CACHE[z_val]
+    # Cache key must now include both Z and Y to prevent cross-contamination
+    cache_key = (round(z_val, 4), round(y_ratio, 4))
+    if cache_key in _MIXED_CACHE:
+        return _MIXED_CACHE[cache_key]
 
     raw = load_all_raw_data(base_dir)
     if not raw or 'H' not in raw:
         return None
 
-    # Determine mass fractions
-    x_frac = 0.74 * (1.0 - z_val)
-    y_frac = 0.26 * (1.0 - z_val)
+    # THE FIX: Dynamically assign mass fractions using the piloted Y ratio!
+    x_frac = (1.0 - y_ratio) * (1.0 - z_val)
+    y_frac = y_ratio * (1.0 - z_val)
     z_frac = z_val
 
-    # Establish the master thermodynamic grid using Hydrogen as the base
     base_grid_lin = raw['H'][:, :2]
     mask = (base_grid_lin[:, 0] > 0) & (base_grid_lin[:, 1] > 0)
     base_grid_log = np.log10(base_grid_lin[mask])
 
     def get_component_props(comp_key):
-        """Helper to safely extract and interpolate component properties."""
         if comp_key not in raw:
             return None, None
-            
         data = raw[comp_key]
         pts_log = np.log10(data[:, :2])
         rho_val = np.log10(data[:, 2])
         s_val = data[:, 3]
-        
         return interpolate_table(pts_log, rho_val, base_grid_log), \
                interpolate_table(pts_log, s_val, base_grid_log)
 
-    # 1. Gather all component properties onto the master grid
     rho_h, s_h = get_component_props('H')
-    
     rho_he, s_he = get_component_props('He')
     if rho_he is None:
-        # Fallback if Helium is missing
         rho_he, s_he = rho_h, s_h
         
     rho_z, s_z = get_component_props('H2O')
     if rho_z is None:
-        # Fallback if Heavy proxy (Water) is missing: simulate dense metal proxy
         rho_z, s_z = rho_h + 0.7, s_h
 
-    # 2. Additive Volume Law for Density
     vol_mix = (x_frac / 10**rho_h) + (y_frac / 10**rho_he) + (z_frac / 10**rho_z)
     rho_mix = 1.0 / vol_mix
-    
-    # 3. Additive Entropy Mixing Law
     s_mix = x_frac * s_h + y_frac * s_he + z_frac * s_z
     
-    # Bundle into final cached array
     mixed_data = np.column_stack((base_grid_log[:, 0], base_grid_log[:, 1], np.log10(rho_mix), s_mix))
-    _MIXED_CACHE[z_val] = mixed_data
+    _MIXED_CACHE[cache_key] = mixed_data  # Save to the new tuple-based cache
     
     return mixed_data
 
 
-def generate_fluid_interpolators(z_profile: np.ndarray, base_dir: str = str(DATA_DIR)) -> dict:
-    """
-    Pre-computes and caches 2D interpolators for every unique metallicity step 
-    in the planetary envelope's 'staircase' gradient.
-    """
+def generate_fluid_interpolators(z_profile: np.ndarray, y_ratio: float = 0.26, base_dir: str = str(DATA_DIR)) -> dict:
+    """Pre-computes 2D interpolators for every Z-step, using the dynamic Y ratio."""
     unique_z = np.unique(z_profile)
     stack = {}
     
     for z in unique_z:
-        table = get_mix_table(z, base_dir)
+        table = get_mix_table(z, y_ratio, base_dir)  # Pass the dynamic ratio down!
         if table is None:
             continue
             
@@ -439,7 +426,6 @@ def generate_fluid_interpolators(z_profile: np.ndarray, base_dir: str = str(DATA
         }
         
     return stack
-
 
 # =============================================================================
 # KD-TREE ADIABAT STEPPER

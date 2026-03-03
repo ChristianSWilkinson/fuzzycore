@@ -49,6 +49,9 @@ def solve_structure(target_val: float, params: dict, mode: str,
     
     # Initialize the base interpolators
     rock = eos.get_rock_interpolator()  # Now guaranteed to exist
+
+    # Extract the dynamic H/He ratio from params (defaults to Solar 0.26)
+    y_ratio = params.get('Y_ratio', 0.26)
     
     # Default to a 10-step gradient if z_profile is missing
     default_z_profile = np.linspace(0.01, 1.0, 10)
