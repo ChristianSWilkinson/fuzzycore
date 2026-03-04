@@ -4,6 +4,7 @@ from scipy.optimize import brentq
 
 from . import constants as c
 from . import eos
+from . import utils  # <-- Added utility module import
 
 
 # =============================================================================
@@ -348,10 +349,10 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict,
 
     # Physical validity check: Ensure mantle isn't structurally crushed
     if M_rock_actual < params['M_rock'] * 0.99 or P_rock_top <= P_int_bar:
-        return {
+        res_fail = {
             "M_total": M_rock_actual, 
             "R_total": R_rock, 
-            "M_Z_total": M_rock_actual,
+            "M_core_actual": M_rock_actual, # Needed for rigorous heavy element calculation
             "R": core_res['R'], 
             "M": core_res['M'], 
             "P": core_res['P'], 
@@ -363,6 +364,14 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict,
             "R_int": R_rock, 
             "P_int": P_rock_top
         }
+        
+        # Rigorously calculate M_Z and dt/dS even for failed structures
+        res_fail["M_Z_total"] = utils.evaluate_heavy_element_mass(res_fail, params.get('z_base', 0.0))
+        t_eff = params.get('T_int', params.get('T_surf', 500.0))
+        c_info = utils.calculate_staircase_dt_ds(res_fail, t_eff)
+        res_fail["dt_ds_total"] = c_info['total_dt_ds']
+        res_fail["dt_ds_layers"] = c_info['layer_contributions']
+        return res_fail
 
     # 4. Integrate Water Mantle (Bottom-Up)
     r = R_rock
@@ -429,7 +438,6 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict,
 
     # 5. Integrate Gaseous Envelope (Bottom-Up)
     p_surf_pa = params['P_surf'] * 1e5
-    m_z_total = m  # Track total heavy mass before adding diffuse atmospheric Z
     
     while p_pa > p_surf_pa:
         p_log = np.log10(max(1e-10, p_pa / 1e5))
@@ -472,12 +480,27 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict,
     Rho_h.append(rho); T_h.append(temp)
     S_h.append(entr); Z_h.append(z_val)
 
-    return {
-        "M_total": m, "R_total": r, "M_Z_total": m_z_total,
+    # Compile the final result structure
+    result = {
+        "M_total": m, "R_total": r, 
+        "M_core_actual": core_res['M_actual'], # Explicit core mass tracker
         "R": np.array(R_h), "M": np.array(M_h), "P": np.array(P_h), 
         "Rho": np.array(Rho_h), "T": np.array(T_h), "S": np.array(S_h), "Z": np.array(Z_h),
         "R_rock": R_rock, "R_int": R_int, "P_int": P_int_bar
     }
+    
+    # -------------------------------------------------------------------------
+    # AUTOMATIC POST-PROCESSING
+    # Inject exactly calculated metrics directly into the returned result dictionary
+    # -------------------------------------------------------------------------
+    result["M_Z_total"] = utils.evaluate_heavy_element_mass(result, params.get('z_base', 0.0))
+    
+    t_eff = params.get('T_int', params.get('T_surf', 500.0))
+    c_info = utils.calculate_staircase_dt_ds(result, t_eff)
+    result["dt_ds_total"] = c_info['total_dt_ds']
+    result["dt_ds_layers"] = c_info['layer_contributions']
+
+    return result
 
 
 def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
@@ -640,7 +663,6 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
     r = R_int_final
     m = final_core['M_actual']
     p_pa = P_int_final * 1e5
-    m_z = m 
     
     R_h, M_h, P_h = list(final_core['R']), list(final_core['M']), list(final_core['P'])
     Rho_h, T_h = list(final_core['Rho']), list(final_core['T'])
@@ -680,7 +702,6 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
 
         # Update mass and geometric arrays
         m += 4 * np.pi * r**2 * rho * dr
-        m_z += 4 * np.pi * r**2 * rho * dr * max(0.0, z_val - params.get('z_base', 0.0))
         r += dr
         p_pa = p_new
         
@@ -695,12 +716,27 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
     Rho_h.append(rho); T_h.append(temp)
     S_h.append(entr); Z_h.append(z_val)
 
-    if debug:
-        print(f"[SUCCESS] M={m/c.M_JUPITER:.3f} Mj")
-
-    return {
-        "M_total": m, "R_total": r, "M_Z_total": m_z, 
+    # Compile the final result structure
+    result = {
+        "M_total": m, "R_total": r, 
+        "M_core_actual": final_core['M_actual'], # Explicit core mass tracker
         "R": np.array(R_h), "M": np.array(M_h), "P": np.array(P_h), 
         "Rho": np.array(Rho_h), "T": np.array(T_h), "S": np.array(S_h), "Z": np.array(Z_h), 
         "R_rock": R_int_final, "R_int": R_int_final
     }
+
+    # -------------------------------------------------------------------------
+    # AUTOMATIC POST-PROCESSING
+    # Inject exactly calculated metrics directly into the returned result dictionary
+    # -------------------------------------------------------------------------
+    result["M_Z_total"] = utils.evaluate_heavy_element_mass(result, params.get('z_base', 0.0))
+    
+    t_eff = params.get('T_int', params.get('T_surf', 500.0))
+    c_info = utils.calculate_staircase_dt_ds(result, t_eff)
+    result["dt_ds_total"] = c_info['total_dt_ds']
+    result["dt_ds_layers"] = c_info['layer_contributions']
+
+    if debug:
+        print(f"[SUCCESS] M={m/c.M_JUPITER:.3f} Mj")
+
+    return result
