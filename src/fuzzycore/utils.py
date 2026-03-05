@@ -194,15 +194,13 @@ def calculate_staircase_dt_ds(results: dict, t_int: float) -> dict:
     
     # Integrate layer-by-layer
     for z_val in unique_z:
-        # Create a boolean mask for the current compositional layer
-        # (using np.isclose to handle any floating-point rounding variations)
         mask = np.isclose(Z[:-1], z_val, atol=1e-4)
         
-        # Integrate only within the physical boundaries of this specific layer
         layer_integral = np.sum(integrand[mask] * dr[mask])
-        layer_dt_ds = layer_integral / denominator
         
-        # Store the contribution
+        # --- FIX: Added the minus sign required by the energy balance equation! ---
+        layer_dt_ds = - (layer_integral / denominator)
+        
         layer_contributions[z_val] = layer_dt_ds
         total_dt_ds += layer_dt_ds
         
