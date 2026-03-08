@@ -1,15 +1,16 @@
 """
-Kepler-11e 1D Parameter Sweep: Distribution Analysis
+Kepler-11e 1D Parameter Sweep: Multi-Track Distribution Analysis
 
 This script performs a parallelized 1D parameter sweep for the highly inflated 
-super-puff exoplanet Kepler-11e. It runs two distinct physical tracks to isolate 
-the radius inflation mechanisms:
+super-puff exoplanet Kepler-11e. It explores different structural configurations
+by defining distinct evolutionary tracks:
 
-1. Bulk Envelope Transfer: Mass shifts from the solid core into the envelope using a 
-   fixed compositional shape (sigma = 0.25), adding both Metals and H/He to the gas.
-2. Direct Metal Transfer: Dynamically tunes the diluteness parameter (sigma) 
-   to ensure the total heavy element mass is strictly conserved at 7.5 M_Earth. 
-   Mass lost from the solid core is converted 100% into suspended metals.
+1. Bulk Envelope Transfer: A baseline track where mass shifts into the envelope 
+   using a fixed compositional shape, altering the total metal/gas ratio.
+2. Direct Metal Transfers: Multiple tracks dynamically tuning sigma to conserve 
+   different absolute heavy element budgets (e.g., 7.9, 7.0, and 6.0 Earth masses).
+   This isolates the thermal inflation effect of dilute cores across different 
+   bulk compositions.
 """
 
 import os
@@ -32,7 +33,6 @@ import fuzzycore.utils as utils
 # =============================================================================
 
 M_KEPLER11E: float = 7.95 * c.M_EARTH
-TARGET_MZ_TOTAL: float = 7.9 * c.M_EARTH  # The conserved total heavy element mass
 
 RESULTS_FILE: str = "../data/kepler11e_sweep_results.csv"
 TEMP_FILE: str = "../data/kepler11e_sweep_temp.csv"
@@ -61,18 +61,19 @@ def get_params(m_core: float, sigma: float) -> dict:
     }
 
 
-def find_conserved_sigma(m_core: float, lock) -> float:
+def find_conserved_sigma(m_core: float, target_mz_me: float, lock) -> float:
     """
     Optimizes the sigma parameter so the total heavy element mass (Core + Dilute)
-    is strictly conserved at TARGET_MZ_TOTAL.
+    is strictly conserved at the track's specific target mass.
     """
+    target_mz_kg = target_mz_me * c.M_EARTH
+    
     # =========================================================================
-    # THE PHYSICAL BYPASS:
-    # m_core is in Earth masses. If we are at our max target mass (7.5 M_E), 
-    # we bypass the optimizer entirely to prevent integration crashes and
-    # strictly force the sigma=0.0 adiabatic (zero-dilute-mass) fallback.
+    # DYNAMIC PHYSICAL BYPASS:
+    # If the solid core accounts for the entire heavy element budget of this 
+    # specific track, force the sigma=0.0 adiabatic fallback.
     # =========================================================================
-    if m_core >= 7.49: 
+    if m_core >= target_mz_me - 0.01: 
         return 0.0  
 
     def mz_error(sig: float) -> float:
@@ -85,7 +86,7 @@ def find_conserved_sigma(m_core: float, lock) -> float:
             return 1e6  # Heavy penalty for unphysical regions
             
         actual_mz = res.get('M_Z_total', m_core * c.M_EARTH)
-        return abs(actual_mz - TARGET_MZ_TOTAL)
+        return abs(actual_mz - target_mz_kg)
 
     # Search for the optimal sigma, allowing it to get extremely sharp
     res = minimize_scalar(
@@ -97,19 +98,19 @@ def find_conserved_sigma(m_core: float, lock) -> float:
 def run_single_model(args: tuple, lock) -> tuple:
     """
     Executes the integration for a specific core mass and transfer mode, 
-    enforcing strict conservation checks for the Direct Metal track.
+    enforcing strict conservation checks based on the track's metal target.
     """
-    m_core, mode = args
-    trial_id = f"K11e_{mode.replace(' ', '')}_{m_core:.3f}"
+    m_core, track_name, mode_type, target_mz_me = args
+    trial_id = f"K11e_{mode_type}_{target_mz_me}_{m_core:.3f}"
     
     try:
-        # Determine the correct sigma based on the physical mode
-        if mode == 'Bulk Envelope Transfer':
+        # Determine the correct sigma based on the physical mode type
+        if mode_type == 'Bulk':
             # Original physics: Fixed sigma shape
             sigma = 0.25
         else:
-            # Direct Metal Transfer: Tune sigma to conserve exactly 7.5 M_E of metals
-            sigma = find_conserved_sigma(m_core, lock)
+            # Direct Metal Transfer: Tune sigma to conserve exact target metals
+            sigma = find_conserved_sigma(m_core, target_mz_me, lock)
             
         params = get_params(m_core, sigma)
         
@@ -128,36 +129,31 @@ def run_single_model(args: tuple, lock) -> tuple:
             m_z_tot_kg = res.get('M_Z_total', m_core * c.M_EARTH)
             m_z_tot_me = m_z_tot_kg / c.M_EARTH
             
-            # =================================================================
-            # STRICT GATEKEEPER:
-            # If we are in Direct Metal mode, the total heavy elements MUST be
-            # extremely close to 7.5 Earth masses. If the optimizer failed and 
-            # gave us a bad sigma, we discard the result so it doesn't pollute 
-            # our plot! (Tolerance set to 0.05 M_earth)
-            # =================================================================
-            if mode == 'Direct Metal Transfer':
-                target_me = TARGET_MZ_TOTAL / c.M_EARTH
-                if abs(m_z_tot_me - target_me) > 0.05:
-                    error_msg = f"Discarded: Conservation failed (M_z = {m_z_tot_me:.2f} M_E)"
-                    return False, m_core, mode, error_msg
+            # STRICT GATEKEEPER: Check against the dynamic target
+            if mode_type == 'Direct':
+                if abs(m_z_tot_me - target_mz_me) > 0.05:
+                    error_msg = f"Discarded: Conservation failed (M_z = {m_z_tot_me:.2f} vs Target {target_mz_me:.2f})"
+                    return False, m_core, track_name, error_msg
 
             # Dilute mass is the total heavy elements minus the solid core
             m_dilute = max(m_z_tot_me - m_core, 0.0)
             
             result_dict = {
                 'M_core_Me': m_core,
-                'Transfer_Mode': mode,
+                'Transfer_Mode': track_name,
+                'Target_Mz_Me': target_mz_me,
                 'M_dilute_Me': m_dilute,
                 'M_Z_total_Me': m_z_tot_me,
                 'R_total_Re': r_tot_re,
-                'Sigma_Used': sigma
+                'Sigma_Used': sigma,
+                'dt_ds_total': res.get('dt_ds_total', np.nan)
             }
-            return True, m_core, mode, result_dict
+            return True, m_core, track_name, result_dict
         else:
-            return False, m_core, mode, "Solver failed to converge."
+            return False, m_core, track_name, "Solver failed to converge."
             
     except Exception as e:
-        return False, m_core, mode, str(e)
+        return False, m_core, track_name, str(e)
 
 
 # =============================================================================
@@ -166,26 +162,19 @@ def run_single_model(args: tuple, lock) -> tuple:
 
 if __name__ == '__main__':
     print("================================================================")
-    print(" Kepler-11e 1D Sweep: Bulk vs Direct Metal Transfer ")
+    print(" Kepler-11e 1D Sweep: Multi-Track Metal Consumptions ")
     print("================================================================")
     
-    modes = ['Bulk Envelope Transfer', 'Direct Metal Transfer']
-    
-    # 1. Bulk Transfer Grid: Core can grow up to ~7.90 Me
-    core_masses_bulk = np.concatenate([
-        np.linspace(7.90, 7.5, 8),   # Very dense near zero dilute mass
-        np.linspace(7.0, 2.0, 10)    # Standard spacing elsewhere
-    ])
-    
-    # 2. Direct Metal Grid: Core strictly capped at 7.50 Me
-    core_masses_direct = np.concatenate([
-        np.linspace(7.90, 7.0, 8),   # Very dense near zero dilute mass
-        np.linspace(6.5, 2.0, 10)    # Standard spacing elsewhere
-    ])
+    # Define all the evolutionary tracks you want to explore
+    TRACKS = [
+        {"name": "Bulk Envelope Transfer", "type": "Bulk", "target_mz_me": 7.9},
+        {"name": "Direct Metal (Total Z = 7.9 M_E)", "type": "Direct", "target_mz_me": 7.9},
+        {"name": "Direct Metal (Total Z = 7.0 M_E)", "type": "Direct", "target_mz_me": 7.0},
+        {"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
+    ]
     
     # Checkpoint Logic
     completed_tasks = set()
-    # Ensure data directory exists
     os.makedirs(os.path.dirname(RESULTS_FILE), exist_ok=True)
     
     if os.path.exists(RESULTS_FILE):
@@ -197,19 +186,35 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"[*] Could not read {RESULTS_FILE}: {e}")
             
-    # Assign the correct grid to the correct mode!
+    # Dynamically generate grids anchored to each track's specific metal target
     tasks_to_run = []
-    for mode in modes:
-        mass_grid = core_masses_bulk if mode == 'Bulk Envelope Transfer' else core_masses_direct
+    for track in TRACKS:
+        t_name = track['name']
+        t_type = track['type']
+        t_mz = track['target_mz_me']
+        
+        # Grid clustering: High density near the track's starting point (0 dilute mass)
+        if t_type == 'Bulk':
+            mass_grid = np.concatenate([
+                np.linspace(t_mz, t_mz - 0.4, 8),   
+                np.linspace(t_mz - 0.5, 2.0, 10)    
+            ])
+        else:
+            mass_grid = np.concatenate([
+                np.linspace(t_mz, t_mz - 0.5, 8),   
+                np.linspace(t_mz - 1.0, 2.0, 10)    
+            ])
+            
         for m in mass_grid:
-            if (round(m, 3), mode) not in completed_tasks:
-                tasks_to_run.append((m, mode))
+            if (round(m, 3), t_name) not in completed_tasks:
+                tasks_to_run.append((m, t_name, t_type, t_mz))
             
     print(f"[*] Tasks remaining to compute: {len(tasks_to_run)}")
     
     # Parallel Execution
     if tasks_to_run:
-        n_workers = min(mp.cpu_count() - 1, 4)
+        # Re-enabled multiprocessing to speed up the multiple tracks
+        n_workers = min(mp.cpu_count() - 1, 6)
         n_workers = max(1, n_workers) 
         n_workers = 1
         
@@ -243,18 +248,31 @@ if __name__ == '__main__':
     if os.path.exists(RESULTS_FILE):
         df_plot = pd.read_csv(RESULTS_FILE)
         
-        plt.figure(figsize=(9, 6))
+        plt.figure(figsize=(10, 7))
         
-        colors = {'Bulk Envelope Transfer': '#3498db', 'Direct Metal Transfer': '#e74c3c'}
-        markers = {'Bulk Envelope Transfer': 's', 'Direct Metal Transfer': 'o'}
+        # Define aesthetic mapping for our distinct tracks
+        colors = {
+            'Bulk Envelope Transfer': '#3498db',           # Blue
+            'Direct Metal (Total Z = 7.9 M_E)': '#e74c3c', # Red
+            'Direct Metal (Total Z = 7.0 M_E)': '#e67e22', # Orange
+            'Direct Metal (Total Z = 6.0 M_E)': '#9b59b6'  # Purple
+        }
+        markers = {
+            'Bulk Envelope Transfer': 's', 
+            'Direct Metal (Total Z = 7.9 M_E)': 'o',
+            'Direct Metal (Total Z = 7.0 M_E)': '^',
+            'Direct Metal (Total Z = 6.0 M_E)': 'D'
+        }
 
-        for mode in modes:
+        for track in TRACKS:
+            mode = track['name']
             df_mode = df_plot[df_plot['Transfer_Mode'] == mode].sort_values(by='M_core_Me', ascending=False)
+            
             if len(df_mode) > 1:
                 plt.plot(
                     df_mode['M_dilute_Me'], df_mode['R_total_Re'], 
-                    marker=markers[mode], markersize=7, linestyle='-', 
-                    color=colors[mode], linewidth=2.5, label=mode
+                    marker=markers.get(mode, 'x'), markersize=7, linestyle='-', 
+                    color=colors.get(mode, 'gray'), linewidth=2.5, label=mode
                 )
 
         plt.axhline(y=4.67, color='black', linestyle='--', alpha=0.6, label='Kepler-11e Observed Radius')
@@ -271,8 +289,7 @@ if __name__ == '__main__':
         plt.yticks(fontsize=12)
         plt.tight_layout()
 
-        # Ensure figures directory exists
-        plot_filename = "../figures/kepler11e_transfer_comparison.pdf"
+        plot_filename = "../figures/kepler11e_multi_track_comparison.pdf"
         os.makedirs(os.path.dirname(plot_filename), exist_ok=True)
         
         plt.savefig(plot_filename, format='pdf', bbox_inches='tight')
