@@ -43,6 +43,33 @@ def solve_structure(target_val: float, params: dict, mode: str,
         dict: The final converged planetary profile dictionary. Returns `None` 
             if the solver fails to find a physically valid root.
     """
+
+    # =========================================================================
+    # 0. DEBUG: ABSOLUTE INPUT INTERCEPTION (TRIPWIRE)
+    # =========================================================================
+    if params.get('debug', False):
+        print("\n" + "="*60, flush=True)
+        print(f"🛑 [FUZZYCORE TRIPWIRE: EXACT INPUTS RECEIVED] 🛑", flush=True)
+        print(f"Trial ID: {trial_id} | Mode: {mode}", flush=True)
+        
+        # Check the Target Value (Mass or Gravity)
+        unit_guess = "kg" if mode == 'mass' else "m/s^2"
+        print(f"Target Value: {target_val:.5e} [{unit_guess}]", flush=True)
+        if mode == 'mass':
+            print(f"   -> Equivalent to: {target_val / c.M_EARTH:.2f} Earth Masses", flush=True)
+            print(f"   -> Equivalent to: {target_val / c.M_JUPITER:.5f} Jupiter Masses", flush=True)
+            
+        print("-" * 60, flush=True)
+        print("Raw Parameters Dictionary:", flush=True)
+        for k, v in params.items():
+            if isinstance(v, np.ndarray):
+                print(f"  - {k}: ndarray (shape: {v.shape}, mean: {np.mean(v):.3f})", flush=True)
+            elif isinstance(v, float) and v > 1e20: # Flag suspiciously huge numbers
+                print(f"  - {k}: {v:.3e} ⚠️ (MASSIVE NUMBER)", flush=True)
+            else:
+                print(f"  - {k}: {v}", flush=True)
+        print("="*60 + "\n", flush=True)
+
     # =========================================================================
     # 1. Setup Equation of State (EOS) Data
     # =========================================================================
