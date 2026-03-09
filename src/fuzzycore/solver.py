@@ -185,9 +185,52 @@ def solve_structure(target_val: float, params: dict, mode: str,
     # =========================================================================
     
     guess = params.get('initial_log_pc', None)
+
+    # Intercept the guess by mining the CSV for the closest matching model
+    if os.path.exists(csv_file):
+        try:
+            # Safely read the historical database
+            with write_lock:
+                df_history = pd.read_csv(csv_file)
+            
+            # Filter for valid completed interior integrations
+            df_history = df_history[df_history['status'] == 'success_intermediate']
+            
+            if not df_history.empty:
+                if mode == 'mass':
+                    # Calculate the absolute difference between historical masses and our target
+                    achieved_mass_kg = df_history['M_total_Mj'] * c.M_JUPITER
+                    best_idx = np.argmin(np.abs(achieved_mass_kg - target_val))
+                    
+                    best_pc = df_history.iloc[best_idx]['P_center_bar']
+                    guess = np.log10(best_pc)
+                    
+                    if params.get('debug'):
+                        print(f"  [Smart Prior] Mined historical model with mass {achieved_mass_kg.iloc[best_idx]/c.M_JUPITER:.4f} Mj.")
+                        print(f"  [Smart Prior] Overriding initial_log_pc to {guess:.3f}")
+                        
+                elif mode == 'gravity':
+                    # Calculate historical gravities (g = GM/r^2) and find the closest match
+                    achieved_mass_kg = df_history['M_total_Mj'] * c.M_JUPITER
+                    achieved_radius_m = df_history['R_total_Rj'] * c.R_JUPITER
+                    achieved_g = (c.G_CONST * achieved_mass_kg) / (achieved_radius_m**2)
+                    
+                    best_idx = np.argmin(np.abs(achieved_g - target_val))
+                    
+                    best_pc = df_history.iloc[best_idx]['P_center_bar']
+                    guess = np.log10(best_pc)
+                    
+                    if params.get('debug'):
+                        print(f"  [Smart Prior] Mined historical model with gravity {achieved_g.iloc[best_idx]:.3f} m/s².")
+                        print(f"  [Smart Prior] Overriding initial_log_pc to {guess:.3f}")
+                        
+        except Exception as e:
+            if params.get('debug'):
+                print(f"  [Smart Prior] Failed to read historical database: {e}")
+
     bracket = None
 
-    # If an initial guess is provided, attempt to build a bracket around it
+    # If an initial guess is provided (or mined!), attempt to build a bracket around it
     if guess is not None:
         step = 0.5 
         test_points = [guess - step, guess + step]
@@ -217,9 +260,18 @@ def solve_structure(target_val: float, params: dict, mode: str,
 
     # Fallback: If no warm start or the bracket expansion failed, run a global scan
     if bracket is None:
-        print(f"Trial {trial_id}: Global scan initiated")
+        if params.get('debug'):
+            print(f"Trial {trial_id}: Global scan initiated (Evaluating 15 pressure roots...)")
+            
         grid = np.linspace(6.5, 13.5, 15)
-        vals = [objective(p) for p in grid]
+        vals = []
+        
+        # Process this in a loop to provide progress updates
+        for idx, p in enumerate(grid):
+            v = objective(p)
+            vals.append(v)
+            if params.get('debug'):
+                print(f"  [Scan {idx+1}/15] logPc={p:.2f} -> Error={v:.3e}")
         
         # Search the grid for a sign change indicating a root
         for i in range(len(vals) - 1):
