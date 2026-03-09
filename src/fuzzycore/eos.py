@@ -256,7 +256,7 @@ def get_core_interpolator(iron_fraction: float = 0.33, base_dir: str = str(DATA_
     iron_rho_log = np.log10(iron_data[:, 2])
 
     if debug:
-        print(f"\n[DEBUG] Core Interpolator: Projecting Iron onto Rock grid...")
+        print(f"\n[DEBUG] Core Interpolator: Projecting Iron onto Rock grid...", flush=True)
         
     iron_rho_at_rock_grid = interpolate_table(iron_pts_log, iron_rho_log, rock_pts_log)
     
@@ -267,7 +267,7 @@ def get_core_interpolator(iron_fraction: float = 0.33, base_dir: str = str(DATA_
     rho_mix = 1.0 / vol_mix
 
     if debug:
-        print(f"[DEBUG] Core Interpolator: Building Scipy LinearNDInterpolator (Qhull Delaunay)...")
+        print(f"[DEBUG] Core Interpolator: Building Scipy LinearNDInterpolator (Qhull Delaunay)...", flush=True)
         
     interp = LinearNDInterpolator(rock_pts_log, np.log10(rho_mix), rescale=True)
     
