@@ -229,13 +229,12 @@ def interpolate_table(grid_points: np.ndarray, values: np.ndarray, query_points:
 # CORE MIXER (Iron + Silicate Rock)
 # =============================================================================
 
-def get_core_interpolator(iron_fraction: float = 0.33, base_dir: str = str(DATA_DIR)) -> LinearNDInterpolator:
+def get_core_interpolator(iron_fraction: float = 0.33, base_dir: str = str(DATA_DIR), debug: bool = False) -> LinearNDInterpolator:
     """
     Constructs an additive volume mixing interpolator for a condensed solid core.
     """
     global _CORE_CACHE, _ROCK_BOUNDS
     
-    # Check cache to avoid redundant, expensive Delaunay generation
     cache_key = round(iron_fraction, 3)
     if cache_key in _CORE_CACHE:
         return _CORE_CACHE[cache_key]
@@ -245,41 +244,43 @@ def get_core_interpolator(iron_fraction: float = 0.33, base_dir: str = str(DATA_
         return None
 
     rock_data = raw['Rock']
-    # Fallback entirely to Rock EOS if Iron EOS is unexpectedly missing
     iron_data = raw.get('Iron', rock_data)
 
-    # Establish safety bounds for thermal clamping during integration
     _ROCK_BOUNDS['t_min'] = rock_data[:, 1].min()
     _ROCK_BOUNDS['t_max'] = rock_data[:, 1].max()
 
-    # Convert coordinates and values to log10 space for interpolation stability
     rock_pts_log = np.log10(rock_data[:, :2])
     rock_rho_log = np.log10(rock_data[:, 2])
 
     iron_pts_log = np.log10(iron_data[:, :2])
     iron_rho_log = np.log10(iron_data[:, 2])
 
-    # 1. Standardize the grid: Project the Iron EOS onto the exact Rock (P, T) nodes
+    if debug:
+        print(f"\n[DEBUG] Core Interpolator: Projecting Iron onto Rock grid...")
+        
     iron_rho_at_rock_grid = interpolate_table(iron_pts_log, iron_rho_log, rock_pts_log)
-
-    # 2. Compute Additive Volume Mixing
-    # Volume = Mass / Density. Assuming total mass = 1 for mixing fractions.
+    
     x_fe = iron_fraction
     x_rock = 1.0 - x_fe
 
     vol_mix = (x_fe / 10**iron_rho_at_rock_grid) + (x_rock / 10**rock_rho_log)
     rho_mix = 1.0 / vol_mix
 
-    # 3. Generate and cache the final interpolator
+    if debug:
+        print(f"[DEBUG] Core Interpolator: Building Scipy LinearNDInterpolator (Qhull Delaunay)...")
+        
     interp = LinearNDInterpolator(rock_pts_log, np.log10(rho_mix), rescale=True)
-    _CORE_CACHE[cache_key] = interp
     
+    if debug:
+        print(f"[DEBUG] Core Interpolator: SUCCESS!")
+    
+    _CORE_CACHE[cache_key] = interp
     return interp
 
 
-def get_rock_interpolator(base_dir: str = str(DATA_DIR)) -> LinearNDInterpolator:
+def get_rock_interpolator(base_dir: str = str(DATA_DIR), debug: bool = False) -> LinearNDInterpolator:
     """Legacy wrapper function. Returns a core interpolator with 0% Iron (Pure Rock)."""
-    return get_core_interpolator(iron_fraction=0.0, base_dir=base_dir)
+    return get_core_interpolator(iron_fraction=0.0, base_dir=base_dir, debug=debug)
 
 
 def query_core_eos(log_p: float, log_t: float, iron_fraction: float = 0.33) -> float:
@@ -403,13 +404,20 @@ def get_mix_table(z_val: float, y_ratio: float = 0.26, base_dir: str = str(DATA_
     return mixed_data
 
 
-def generate_fluid_interpolators(z_profile: np.ndarray, y_ratio: float = 0.26, base_dir: str = str(DATA_DIR)) -> dict:
+def generate_fluid_interpolators(z_profile: np.ndarray, y_ratio: float = 0.26, base_dir: str = str(DATA_DIR), debug: bool = False) -> dict:
     """Pre-computes 2D interpolators for every Z-step, using the dynamic Y ratio."""
     unique_z = np.unique(z_profile)
     stack = {}
     
-    for z in unique_z:
-        table = get_mix_table(z, y_ratio, base_dir)  # Pass the dynamic ratio down!
+    if debug:
+        print(f"\n[DEBUG] Fluid Stack: Generating interpolators for {len(unique_z)} unique Z layers...")
+    
+    for i, z in enumerate(unique_z):
+        if debug:
+            print(f"  -> [DEBUG] Processing Z layer {i+1}/{len(unique_z)} (Z = {z:.4f})")
+            print(f"     [DEBUG] Fetching raw mix table...")
+            
+        table = get_mix_table(z, y_ratio, base_dir) 
         if table is None:
             continue
             
@@ -417,6 +425,9 @@ def generate_fluid_interpolators(z_profile: np.ndarray, y_ratio: float = 0.26, b
         rho_vals = table[:, 2]
         s_vals = table[:, 3]
         
+        if debug:
+            print(f"     [DEBUG] Triangulating Density & Entropy meshes via LinearNDInterpolator...")
+            
         stack[z] = {
             'rho': LinearNDInterpolator(points, rho_vals, rescale=True),
             'S': LinearNDInterpolator(points, s_vals, rescale=True),
@@ -425,7 +436,13 @@ def generate_fluid_interpolators(z_profile: np.ndarray, y_ratio: float = 0.26, b
             'S_values': s_vals
         }
         
+        if debug:
+            print(f"     [DEBUG] Mesh built successfully for Z = {z:.4f}!")
+            
+    if debug:
+        print("[DEBUG] Fluid Stack: ALL LAYERS SUCCESSFUL.")    
     return stack
+
 
 # =============================================================================
 # KD-TREE ADIABAT STEPPER
