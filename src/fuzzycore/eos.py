@@ -288,19 +288,23 @@ def query_core_eos(log_p: float, log_t: float, iron_fraction: float = 0.33) -> f
     Safely queries the mixed core interpolator with boundary guards.
     """
     interp = get_core_interpolator(iron_fraction)
-    # Absolute failure fallback
     if interp is None:
         return np.log10(4000.0)
 
-    # Convert out of log space to apply safety clamps
     t_val = 10 ** log_t
     t_clamped = np.clip(t_val, _ROCK_BOUNDS['t_min'] + 1.0, _ROCK_BOUNDS['t_max'] - 1.0)
     log_t_clamped = np.log10(t_clamped)
 
     res = interp(log_p, log_t_clamped)
     
-    # If out-of-bounds yields NaN, return a standard uncompressed rock proxy
+    # High-Pressure Polytropic Extrapolation
     if np.isnan(res):
+        p_bar = 10 ** log_p
+        # If we exceed the table limits (~1e6 bar), scale density using a roughly 
+        # incompressible polytrope (rho scales with P^0.3) to match extreme physics.
+        if p_bar > 1e6:
+            extrap_rho = 12000.0 * ((p_bar / 1e6) ** 0.3)
+            return np.log10(extrap_rho)
         return np.log10(12000.0)
         
     return res
@@ -340,6 +344,10 @@ def get_water_interpolators_complete(base_dir: str = str(DATA_DIR)) -> dict:
     _WATER_INTERP = {
         'rho': LinearNDInterpolator(points_log, rho_log, rescale=True),
         'S': LinearNDInterpolator(points_log, s_val, rescale=True),
+        
+        'rho_near': NearestNDInterpolator(points_log, rho_log, rescale=True),
+        'S_near': NearestNDInterpolator(points_log, s_val, rescale=True),
+        
         'points': points_log,
         'Rho_values': rho_log,
         'S_values': s_val
@@ -511,6 +519,10 @@ class RobustAdiabatStepper:
         # 4. Enforce Physical Clamping
         t_min, t_max = np.min(nb_t), np.max(nb_t)
         t_pred = np.clip(t_pred, t_min - 0.5, t_max + 0.5)
+
+        if np.isnan(t_pred):
+            print("Temperature nan guard uses in stepper") 
+            t_pred = t_log_guess
 
         # 5. Extract final density
         rho_pred = float(self.rho_interp(p_log_target, t_pred))

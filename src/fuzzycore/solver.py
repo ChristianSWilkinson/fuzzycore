@@ -95,31 +95,36 @@ def solve_structure(target_val: float, params: dict, mode: str,
     
     # If the user provides M_rock but no M_water, seamlessly map it to M_core 
     # to prevent KeyErrors in the simple gas giant integrator.
-    if not is_water_world:
-        if 'M_core' not in params and 'M_rock' in params:
-            params['M_core'] = params['M_rock']
-        elif 'M_rock' not in params and 'M_core' in params:
-            params['M_rock'] = params['M_core']  # Fallback for intermediate outputs
+    if 'M_core' not in params and 'M_rock' in params:
+        params['M_core'] = params['M_rock']
+    elif 'M_rock' not in params and 'M_core' in params:
+        params['M_rock'] = params['M_core']  # Fallback for intermediate outputs
 
     # If it is a water world, load the specific ab-initio water tables
     if is_water_world:
         water = eos.get_water_interpolators_complete()
         eos_data['water'] = water
-    
+
     params['target_m'] = target_val
     
     # =========================================================================
-    # 3. Objective Function for Root Finding
+    # 3. Objective Function for Root Finding (WITH MEMORY CACHE)
     # =========================================================================
     
+    # 🛑 THE EFFICIENCY FIX: Cache evaluations so we never integrate the same guess twice!
+    eval_cache = {}
+
     def objective(log_pc: float) -> float:
         """
-        The objective function evaluated by the Brent root-finder.
         Integrates the planet for a guessed central pressure (log_pc) 
         and returns the error relative to the target mass/gravity.
         """
+        # Truncate slightly to prevent floating point cache misses
+        log_pc_rounded = round(float(log_pc), 5)
+        if log_pc_rounded in eval_cache:
+            return eval_cache[log_pc_rounded]
+
         try:
-            # Route to the correct physical integrator
             if is_water_world:
                 res = physics.integrate_water_world(log_pc, params, eos_data)
                 interior_mass = params['M_rock'] + params['M_water']
@@ -128,171 +133,178 @@ def solve_structure(target_val: float, params: dict, mode: str,
                 interior_mass = params['M_core']
             
             # --- FAIL CRITERIA ---
-            # Reject runs that failed to integrate or returned NaNs
             if res is None or np.isnan(res['M'][-1]):
-                if params.get('debug'):
-                    print(f"  [Solver] logPc {log_pc:.2f}: Integration returned None")
-                return -1e30 
+                # 🛑 INSTEAD of a violent -1e30 crash, return the bare interior mass.
+                # This tells the root-finder: "At this pressure, you get exactly 0 envelope."
+                # It creates a perfectly smooth, physical slope for Brentq to follow!
+                if mode == 'mass':
+                    error = interior_mass - target_val 
+                else:
+                    # Approximate gravity of a bare rock to keep the gradient smooth
+                    approx_r = (interior_mass / ( (4/3)*np.pi * 5000 ))**(1/3)
+                    error = (c.G_CONST * interior_mass / approx_r**2) - target_val
+                    
+            elif res['M'][-1] < (interior_mass * 0.99):
+                # Same fallback if the integration stopped prematurely
+                if mode == 'mass':
+                    error = interior_mass - target_val
+                else:
+                    approx_r = (interior_mass / ( (4/3)*np.pi * 5000 ))**(1/3)
+                    error = (c.G_CONST * interior_mass / approx_r**2) - target_val
+                    
+            else:
+                actual_m = res['M'][-1]
+                actual_r = res['R'][-1]
+                
+                # Save intermediate solver steps for tracking
+                intermediate_output = {
+                    'trial_id': f"{trial_id}_step",
+                    'target_mode': mode,
+                    'target_value': target_val,
+                    'P_surf_bar': params['P_surf'],
+                    'T_surf_K': params['T_surf'],
+                    'M_total_Mj': actual_m / c.M_JUPITER,
+                    'R_total_Rj': actual_r / c.R_JUPITER,
+                    'M_Z_total_Me': res.get('M_Z_total', params.get('M_rock', 0)) / c.M_EARTH,
+                    'P_center_bar': 10 ** log_pc,
+                    'Iron_Fraction': params.get('iron_fraction', 0.0),
+                    'status': 'success_intermediate' 
+                }
+                
+                with write_lock:
+                    df_out = pd.DataFrame([intermediate_output])
+                    file_exists = os.path.exists(csv_file)
+                    df_out.to_csv(csv_file, mode='a', header=not file_exists, index=False)
+                
+                if mode == 'gravity':
+                    g_surf = (c.G_CONST * actual_m) / (actual_r ** 2)
+                    error = g_surf - target_val
+                elif mode == 'mass':
+                    error = actual_m - target_val
             
-            # Reject physically invalid runs (e.g., planet mass is less than core mass)
-            if res['M'][-1] < (interior_mass * 0.99):
-                if params.get('debug'):
-                    actual_m_earth = res['M'][-1] / c.M_EARTH
-                    print(f"  [Solver] logPc {log_pc:.2f}: Mass too low ({actual_m_earth:.2f} Me)")
-                return -1e30
-
-            actual_m = res['M'][-1]
-            actual_r = res['R'][-1]
-            
-            # Save intermediate solver steps for tracking / debugging
-            intermediate_output = {
-                'trial_id': f"{trial_id}_step",
-                'target_mode': mode,
-                'target_value': target_val,
-                'P_surf_bar': params['P_surf'],
-                'T_surf_K': params['T_surf'],
-                'M_total_Mj': actual_m / c.M_JUPITER,
-                'R_total_Rj': actual_r / c.R_JUPITER,
-                'M_Z_total_Me': res.get('M_Z_total', params.get('M_rock', 0)) / c.M_EARTH,
-                'P_center_bar': 10 ** log_pc,
-                'Iron_Fraction': params.get('iron_fraction', 0.0),
-                'status': 'success_intermediate' 
-            }
-            
-            # Use lock to safely write to the shared CSV in parallel
-            with write_lock:
-                df_out = pd.DataFrame([intermediate_output])
-                file_exists = os.path.exists(csv_file)
-                df_out.to_csv(csv_file, mode='a', header=not file_exists, index=False)
-            
-            # Calculate the final error metric to return to the root-finder
-            if mode == 'gravity':
-                g_surf = (c.G_CONST * actual_m) / (actual_r ** 2)
-                return g_surf - target_val
-            elif mode == 'mass':
-                if params.get('debug', False):
-                    actual_m_jup = actual_m / c.M_JUPITER
-                    print(f"  [Debug] {trial_id} logPc: {log_pc:.2f} -> Mass: {actual_m_jup:.3f} Mj")  
-                return actual_m - target_val
+            eval_cache[log_pc_rounded] = error
+            return error
                 
         except Exception as e:
             if params.get('debug'):
-                print(f"  [Solver] Error: {e}")
+                print(f"  [Solver] Error at logPc {log_pc:.2f}: {e}")
+            eval_cache[log_pc_rounded] = 1e30
             return 1e30
 
     # =========================================================================
-    # 4. Warm Start & Bracketing Logic
+    # 4. Dynamic Bounds & Concentric Bracketing Search
     # =========================================================================
     
-    guess = params.get('initial_log_pc', None)
+    # Vastly relaxed bounds. Thin envelopes require wildly varied central pressures.
+    m_core_earth = params.get('M_rock', params.get('M_core', 5.0)) / c.M_EARTH
+    
+    if m_core_earth < 2.0: min_pc, max_pc = 4.5, 11.0
+    elif m_core_earth < 10.0: min_pc, max_pc = 5.5, 13.0
+    elif m_core_earth < 50.0: min_pc, max_pc = 6.5, 14.5
+    else: min_pc, max_pc = 7.5, 15.5
 
-    # Intercept the guess by mining the CSV for the closest matching model
+    guess = params.get('initial_log_pc', None)
+    bracket = None
+
+    # --- A. Mine the Smart Prior ---
     if os.path.exists(csv_file):
         try:
-            # Safely read the historical database
             with write_lock:
                 df_history = pd.read_csv(csv_file)
             
-            # Filter for valid completed interior integrations
             df_history = df_history[df_history['status'] == 'success_intermediate']
-            
             if not df_history.empty:
                 if mode == 'mass':
-                    # Calculate the absolute difference between historical masses and our target
                     achieved_mass_kg = df_history['M_total_Mj'] * c.M_JUPITER
                     best_idx = np.argmin(np.abs(achieved_mass_kg - target_val))
-                    
-                    best_pc = df_history.iloc[best_idx]['P_center_bar']
-                    guess = np.log10(best_pc)
-                    
-                    if params.get('debug'):
-                        print(f"  [Smart Prior] Mined historical model with mass {achieved_mass_kg.iloc[best_idx]/c.M_JUPITER:.4f} Mj.")
-                        print(f"  [Smart Prior] Overriding initial_log_pc to {guess:.3f}")
-                        
                 elif mode == 'gravity':
-                    # Calculate historical gravities (g = GM/r^2) and find the closest match
                     achieved_mass_kg = df_history['M_total_Mj'] * c.M_JUPITER
                     achieved_radius_m = df_history['R_total_Rj'] * c.R_JUPITER
                     achieved_g = (c.G_CONST * achieved_mass_kg) / (achieved_radius_m**2)
-                    
                     best_idx = np.argmin(np.abs(achieved_g - target_val))
                     
-                    best_pc = df_history.iloc[best_idx]['P_center_bar']
-                    guess = np.log10(best_pc)
-                    
-                    if params.get('debug'):
-                        print(f"  [Smart Prior] Mined historical model with gravity {achieved_g.iloc[best_idx]:.3f} m/s².")
-                        print(f"  [Smart Prior] Overriding initial_log_pc to {guess:.3f}")
-                        
-        except Exception as e:
-            if params.get('debug'):
-                print(f"  [Smart Prior] Failed to read historical database: {e}")
+                best_pc = df_history.iloc[best_idx]['P_center_bar']
+                guess = np.log10(best_pc)
+                if params.get('debug'):
+                    print(f"  [Smart Prior] Mined historical model. Prior guess set to logPc={guess:.3f}")
+        except Exception:
+            pass
 
-    bracket = None
+    # --- B. The Concentric Search Algorithm ---
+    # We map the "Valley of Death" by testing tight offsets first (±0.05), 
+    # ensuring we never accidentally step over the target mass!
+    center = guess if guess is not None else (min_pc + max_pc) / 2.0
+    center = max(min_pc, min(max_pc, center))
 
-    # If an initial guess is provided (or mined!), attempt to build a bracket around it
-    if guess is not None:
-        step = 0.5 
-        test_points = [guess - step, guess + step]
-        vals = [objective(tp) for tp in test_points]
-        
-        loop_iter = 0
-        
-        # Expand the bracket until the errors have opposite signs (root is bounded)
-        while np.sign(vals[0]) == np.sign(vals[1]):
-            loop_iter += 1
-            
-            if vals[1] < 0:
-                test_points = [test_points[1], test_points[1] + step]
-            else:
-                test_points = [test_points[0] - step, test_points[0]]
-            
-            # Enforce physical bounds for central pressure [10^6 to 10^14 bar]
-            test_points = [max(6.0, test_points[0]), min(14.0, test_points[1])]
-            vals = [objective(tp) for tp in test_points]
-            
-            # Abort expansion if it gets stuck or hits the absolute physical limits
-            if loop_iter > 15 or (test_points[0] <= 6.0 and test_points[1] >= 14.0):
-                break
-        else:
-            # The 'else' block executes if the 'while' condition becomes False naturally
-            bracket = (test_points[0], test_points[1])
-
-    # Fallback: If no warm start or the bracket expansion failed, run a global scan
-    if bracket is None:
-        if params.get('debug'):
-            print(f"Trial {trial_id}: Global scan initiated (Evaluating 15 pressure roots...)")
-            
-        grid = np.linspace(6.5, 13.5, 15)
-        vals = []
-        
-        # Process this in a loop to provide progress updates
-        for idx, p in enumerate(grid):
-            v = objective(p)
-            vals.append(v)
-            if params.get('debug'):
-                print(f"  [Scan {idx+1}/15] logPc={p:.2f} -> Error={v:.3e}")
-        
-        # Search the grid for a sign change indicating a root
-        for i in range(len(vals) - 1):
-            if np.sign(vals[i]) != np.sign(vals[i + 1]):
-                bracket = (grid[i], grid[i + 1])
-                break
+    offsets = [
+        0.0, 
+        -0.05, 0.05, 
+        -0.15, 0.15, 
+        -0.3, 0.3, 
+        -0.6, 0.6, 
+        -1.0, 1.0, 
+        -1.5, 1.5, 
+        -2.0, 2.0,
+        -3.0, 3.0
+    ]
     
+    valid_evals = []
+
+    if params.get('debug'):
+        print(f"  [Solver] Launching concentric bracket search around logPc={center:.2f}...")
+
+    for offset in offsets:
+        p_test = center + offset
+        if min_pc <= p_test <= max_pc:
+            err = objective(p_test)
+            
+            if abs(err) < 1e29:
+                valid_evals.append((p_test, err))
+                valid_evals.sort(key=lambda x: x[0]) # Always sort by pressure
+                
+                # Check for a zero-crossing bracket anywhere in the mapped space
+                for i in range(len(valid_evals) - 1):
+                    if np.sign(valid_evals[i][1]) != np.sign(valid_evals[i+1][1]):
+                        bracket = (valid_evals[i][0], valid_evals[i+1][0])
+                        break
+        if bracket:
+            if params.get('debug'):
+                print(f"  [Solver] ✅ Root securely bracketed between {bracket[0]:.3f} and {bracket[1]:.3f}!")
+            break
+
+    # --- C. Fallback Global Grid ---
+    if not bracket:
+        if params.get('debug'):
+            print("  [Solver] Concentric search failed. Launching ultra-wide global fallback grid...")
+        global_pts = np.linspace(min_pc, max_pc, 25)
+        for p_test in global_pts:
+            err = objective(p_test)
+            if abs(err) < 1e29:
+                valid_evals.append((p_test, err))
+                valid_evals.sort(key=lambda x: x[0])
+                for i in range(len(valid_evals) - 1):
+                    if np.sign(valid_evals[i][1]) != np.sign(valid_evals[i+1][1]):
+                        bracket = (valid_evals[i][0], valid_evals[i+1][0])
+                        break
+            if bracket:
+                if params.get('debug'):
+                    print(f"  [Solver] ✅ Root globally bracketed between {bracket[0]:.3f} and {bracket[1]:.3f}!")
+                break
+
     # =========================================================================
     # 5. Final Convergence (Brent's Method)
     # =========================================================================
-    
     try:
         if bracket:
-            # Solve for the exact log(Pc) that zeroes the objective function
+            # Brentq is super fast because the bracket bounds are loaded from the eval_cache!
             root = brentq(objective, bracket[0], bracket[1], xtol=1e-4)
             
-            # Run one final, clean integration using the converged root
             if is_water_world:
                 return physics.integrate_water_world(root, params, eos_data)
             return physics.integrate_planet(root, params, eos_data)
         else:
+            if params.get('debug'):
+                print("  [Solver] FATAL: Could not bracket the root. Planet may be physically impossible.")
             return None
             
     except Exception as e:
