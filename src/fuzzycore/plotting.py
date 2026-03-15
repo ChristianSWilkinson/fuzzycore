@@ -150,22 +150,30 @@ def plot_diagnostics(results, save_name="structure_diagnostics"):
     plt.show()
 
 
-def plot_trajectory_on_eos(results, params, max_plots=9, save_name="eos_trajectory"):
+def plot_trajectory_on_eos(
+    results, params, max_plots=9, save_name="eos_trajectory"
+):
     """
-    Overlays the planetary P-T trajectory on the compositional phase space.
-    
-    Generates scatter plots of the local Equation of State (EOS) grid points,
-    colored by log10 of Entropy to filter out extreme grid-squaring artifacts.
-    The actual trajectory is drawn as a ghost path, highlighting the active segment
-    corresponding to the local composition (Z).
+    Overlay the planetary P-T trajectory on the compositional phase space.
+
+    This function generates scatter plots of the local Equation of State (EOS)
+    grid points, colored by the base-10 logarithm of entropy to filter out
+    extreme grid-squaring artifacts. The actual trajectory is drawn as a ghost
+    path, highlighting the active segment corresponding to the local
+    composition (Z). The layout is constrained for publication-quality spacing.
 
     Args:
-        results (dict): Integration results containing 'P', 'T', and 'Z' arrays.
-        params (dict): Planetary parameters, specifically needing 'z_profile'.
-        max_plots (int, optional): Maximum number of subplots to generate. 
+        results (dict): Integration results containing 'P', 'T', and 'Z'
+            arrays representing the planetary trajectory.
+        params (dict): Planetary parameters, specifically requiring the
+            'z_profile' key to generate fluid interpolators.
+        max_plots (int, optional): Maximum number of subplots to generate.
             Defaults to 9.
-        save_name (str, optional): Filename for the output plot. 
-            Defaults to "eos_trajectory".
+        save_name (str, optional): Filename for the output plot. Defaults to
+            "eos_trajectory".
+
+    Returns:
+        None
     """
     if not results:
         return
@@ -176,6 +184,7 @@ def plot_trajectory_on_eos(results, params, max_plots=9, save_name="eos_trajecto
     path_z = results['Z']
 
     # Generate local interpolators for the fluid stack
+    # (Assumes 'eos' module is imported globally)
     fluid_stack = eos.generate_fluid_interpolators(params['z_profile'])
     available_z = sorted(fluid_stack.keys())
 
@@ -186,48 +195,58 @@ def plot_trajectory_on_eos(results, params, max_plots=9, save_name="eos_trajecto
     else:
         display_z = available_z
 
-    # Setup the subplot grid
-    cols = 3
-    rows = (len(display_z) + cols - 1) // cols
+    # --- DYNAMIC GRID SETUP ---
+    num_plots = len(display_z)
+    cols = min(3, num_plots)
+    rows = (num_plots + cols - 1) // cols
+
+    # Tighter, more standard dimensions for papers (~3.5 inches per col/row)
+    fig_width = 3.5 * cols
+    fig_height = 3.5 * rows 
+    
+    # layout='constrained' is the modern, robust way to eliminate dead space
     fig, axes = plt.subplots(
-        rows, cols, figsize=(16, 4 * rows), sharex=True, sharey=True
+        rows, cols,
+        figsize=(fig_width, fig_height),
+        sharex=True,
+        sharey=True,
+        layout='constrained' 
     )
+
+    # Ensure axes is always a 1D iterable (handles 1x1 grid properly)
     axes = np.atleast_1d(axes).flatten()
 
     # --- LOG-ENTROPY PERCENTILE FILTERING ---
-    # We calculate the log10 of the entropy values and filter extremums
-    # to avoid unphysical outliers used for grid squaring.
-    all_log_S = [
-        np.log10(np.abs(d['S_values']) + 1e-12) 
+    all_log_s = [
+        np.log10(np.abs(d['S_values']) + 1e-12)
         for d in fluid_stack.values()
     ]
-    flat_log_S = np.concatenate(all_log_S)
+    flat_log_s = np.concatenate(all_log_s)
 
-    # Tight percentile to ensure the colorbar focuses on the physical manifold
-    vmin, vmax = np.percentile(flat_log_S, [0, 90])
-    # ----------------------------------------------
+    # Tight percentile to ensure colorbar focuses on the physical manifold
+    vmin, vmax = np.percentile(flat_log_s, [0, 90])
 
     for i, z_val in enumerate(display_z):
         ax = axes[i]
         data = fluid_stack[z_val]
 
         # Apply the log transformation locally
-        log_S_current = np.log10(np.abs(data['S_values']) + 1e-12)
+        log_s_current = np.log10(np.abs(data['S_values']) + 1e-12)
 
         # Local mask to remove grid-squaring extremums from the scatter
-        mask = (log_S_current >= vmin) & (log_S_current <= vmax)
+        mask = (log_s_current >= vmin) & (log_s_current <= vmax)
 
         # Plot the EOS background phase space
         sc = ax.scatter(
-            data['points'][mask, 0], 
+            data['points'][mask, 0],
             data['points'][mask, 1],
-            c=log_S_current[mask],
-            cmap='RdYlBu_r', 
-            s=10, 
-            vmin=vmin, 
-            vmax=vmax, 
+            c=log_s_current[mask],
+            cmap='RdYlBu_r',
+            s=8,           # Slightly smaller scatter points for a cleaner look
+            vmin=vmin,
+            vmax=vmax,
             alpha=0.3,
-            rasterized=True, 
+            rasterized=True, # Crucial to prevent massive PDF file sizes
             edgecolors='none'
         )
 
@@ -237,7 +256,7 @@ def plot_trajectory_on_eos(results, params, max_plots=9, save_name="eos_trajecto
         # Determine which segments of the trajectory match the current Z
         dist_current = np.abs(path_z - z_val)
         is_active = np.ones_like(dist_current, dtype=bool)
-        
+
         for other_z in available_z:
             if other_z == z_val:
                 continue
@@ -246,38 +265,51 @@ def plot_trajectory_on_eos(results, params, max_plots=9, save_name="eos_trajecto
 
         if np.any(is_active):
             # Plot the active segment for this specific composition
-            ax.plot(path_lp[is_active], path_lt[is_active], 'r-', lw=3)
-            
+            ax.plot(path_lp[is_active], path_lt[is_active], 'r-', lw=2.5)
+
             # Highlight the starting point of the active segment
             ax.scatter(
-                path_lp[is_active][0], 
+                path_lp[is_active][0],
                 path_lt[is_active][0],
-                c='white', 
-                edgecolors='k', 
-                s=50, 
+                c='white',
+                edgecolors='k',
+                s=40,
+                linewidths=1,
                 zorder=10
             )
 
-        ax.set_title(f"Z = {z_val:.4f}")
-        ax.grid(True, alpha=0.3)
+        # Cleaner title formatting for papers
+        ax.set_title(rf"$Z = {z_val:.4f}$", fontsize=11)
+        
+        # Gridlines that guide the eye but don't overpower the data
+        ax.grid(True, linestyle=':', alpha=0.6)
 
     # Clean up any unused axes in the grid
-    for j in range(i + 1, len(axes)):
+    for j in range(num_plots, len(axes)):
         fig.delaxes(axes[j])
 
-    # Adjust layout and append a shared colorbar
-    fig.subplots_adjust(right=0.85)
-    cbar_ax = fig.add_axes([0.88, 0.15, 0.02, 0.7])
-    fig.colorbar(sc, cax=cbar_ax, label=r'$\log_{10}(\text{Entropy})$')
+    # --- DYNAMIC HORIZONTAL COLORBAR AND LAYOUT ---
+    active_axes = axes[:num_plots]
 
-    # Apply global axis labels
-    fig.text(0.5, 0.01, r'$\log_{10}(\text{Pressure [Pa]})$', ha='center')
-    fig.text(
-        0.01, 0.5, 
-        r'$\log_{10}(\text{Temperature [K]})$', 
-        va='center', 
-        rotation='vertical'
+    # Constrained layout handles the padding automatically. 
+    # 'shrink' makes it slightly narrower than the full figure width for elegance.
+    cbar = fig.colorbar(
+        sc,
+        ax=active_axes.tolist(),
+        orientation='horizontal',
+        label=r'$\log_{10}(\text{Entropy})$',
+        shrink=0.8,
+        aspect=45
     )
+    
+    # Optional: ensure colorbar ticks don't look cluttered
+    cbar.ax.tick_params(labelsize=10)
 
+    # Apply global axis labels using sup-labels (hugs the axes tightly)
+    fig.supxlabel(r'$\log_{10}(\text{Pressure [Pa]})$', fontsize=12)
+    fig.supylabel(r'$\log_{10}(\text{Temperature [K]})$', fontsize=12)
+
+    # (Assumes 'save_plot' is a globally defined helper function)
+    # Using bbox_inches='tight' in your save function is highly recommended!
     save_plot(fig, save_name)
     plt.show()

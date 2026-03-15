@@ -480,7 +480,7 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
 
     try:
         # 🛑 THE FIX: Reduced to 7 scan points to save processing time
-        scan_pts = np.linspace(np.log10(params['P_surf']), logP_rock_top - 1e-4, 7)
+        scan_pts = np.linspace(np.log10(params['P_surf']), logP_rock_top - 1e-4, 15)
         vals = [mass_error(p) for p in scan_pts]
 
         bracket = None
@@ -494,7 +494,7 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
             return None
 
         # 🛑 THE FIX: Loosened xtol to 1e-1 so brentq stops immediately after finding a rough bracket!
-        root_logP = brentq(mass_error, bracket[0], bracket[1], xtol=1e-1)
+        root_logP = brentq(mass_error, bracket[0], bracket[1], xtol=1e-3)
         converged_P_int = 10 ** root_logP
         
         return run_water_world_integration(Pc_bar, converged_P_int, params, eos_data)

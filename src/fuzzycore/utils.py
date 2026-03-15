@@ -41,23 +41,28 @@ def generate_gaussian_z_profile(
         np.ndarray: A 1D array containing the Z fraction for each layer, 
         safely clipped between [0.0, 0.99]. If `sigma` <= 0, returns a 
         single-element array `[z_base]`.
-    """
+    """    
     if sigma is None or sigma <= 0.0:
         return np.array([z_base])
 
-    # Spatial domain: x goes from 0 (surface) to 1 (core interface)
     x = np.linspace(0, 1, n_layers)
+    
+    # 1. Calculate the spatial grid resolution
+    dx = 1.0 / max(1, n_layers - 1)
+    
+    # 2. Sub-grid analytical averaging
+    # The exact area of the right-half of a Gaussian is sigma * sqrt(pi / 2).
+    # If this area is smaller than our grid cell (dx), we calculate the 
+    # mathematically conserved *average* metallicity of that cell.
+    gaussian_area = sigma * np.sqrt(np.pi / 2)
+    amplitude_scaler = min(1.0, gaussian_area / dx)
+    
+    dynamic_z_core = z_base + (z_core - z_base) * amplitude_scaler
 
-    # Generate raw Gaussian centered exactly at the core boundary (x = 1.0)
+    # 3. Generate and scale the profile
     raw_z = np.exp(-((x - 1.0) ** 2) / (2 * sigma ** 2))
+    z_profile = z_base + (dynamic_z_core - z_base) * raw_z
 
-    # Normalize the raw Gaussian so it spans exactly [0, 1]
-    raw_z = (raw_z - raw_z.min()) / (raw_z.max() - raw_z.min())
-
-    # Scale and shift the curve to fit boundary conditions
-    z_profile = z_base + (z_core - z_base) * raw_z
-
-    # Ensure physical validity (Z cannot be less than 0 or strictly 1.0 in fluid)
     return np.clip(z_profile, 0.0, 0.99)
 
 

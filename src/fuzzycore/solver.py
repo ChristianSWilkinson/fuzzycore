@@ -176,12 +176,27 @@ def solve_structure(target_val: float, params: dict, mode: str,
                     file_exists = os.path.exists(csv_file)
                     df_out.to_csv(csv_file, mode='a', header=not file_exists, index=False)
                 
+                # Calculate final error and set current_val for logging
                 if mode == 'gravity':
                     g_surf = (c.G_CONST * actual_m) / (actual_r ** 2)
                     error = g_surf - target_val
+                    current_val = g_surf
+                    unit = "m/s^2"
                 elif mode == 'mass':
                     error = actual_m - target_val
+                    current_val = actual_m
+                    unit = "kg"
             
+            # --- 🛑 NEW VERBOSITY INJECTION ---
+            if params.get('debug', False):
+                # Check if it was a bare-rock fallback
+                if res is None or np.isnan(res['M'][-1]) or res['M'][-1] < (interior_mass * 0.99):
+                    print(f"  [Solver Eval] logPc: {log_pc:.4f} | ⚠️ FALLBACK (Env Failed) | Error: {error:.4e}", flush=True)
+                else:
+                    # Print exact tracking metrics
+                    print(f"  [Solver Eval] logPc: {log_pc:.4f} | Current: {current_val:.4e} {unit} | Target: {target_val:.4e} {unit} | Delta: {error:+.4e}", flush=True)
+            # ----------------------------------
+
             eval_cache[log_pc_rounded] = error
             return error
                 

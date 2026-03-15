@@ -21,11 +21,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
+from scipy.optimize import brentq
 
 # Clean package imports natively utilizing the installed fuzzycore package
 import fuzzycore.constants as c
 import fuzzycore.solver as solver
 import fuzzycore.utils as utils
+import fuzzycore.eos as eos
 
 
 # =============================================================================
@@ -45,7 +47,7 @@ TEMP_FILE: str = "../data/kepler11e_sweep_temp.csv"
 def get_params(m_core: float, sigma: float) -> dict:
     """Helper to generate the standard parameter dictionary."""
     z_prof = utils.generate_gaussian_z_profile(
-        n_layers=100, sigma=sigma, z_base=0.05, z_core=0.99
+        n_layers=30, sigma=sigma, z_base=0.02, z_core=0.99
     )
     return {
         'M_core': m_core * c.M_EARTH,   
@@ -54,7 +56,7 @@ def get_params(m_core: float, sigma: float) -> dict:
         'P_surf': 1.0,
         'T_surf': 900.0,                
         'z_base': 0.05,                 
-        'z_profile': np.round(z_prof, 3), 
+        'z_profile': np.round(z_prof, 2), 
         'sigma_val': sigma,              
         'iron_fraction': 0.33,          
         'debug': False
@@ -63,36 +65,85 @@ def get_params(m_core: float, sigma: float) -> dict:
 
 def find_conserved_sigma(m_core: float, target_mz_me: float, lock) -> float:
     """
-    Optimizes the sigma parameter so the total heavy element mass (Core + Dilute)
-    is strictly conserved at the track's specific target mass.
-    """
-    target_mz_kg = target_mz_me * c.M_EARTH
+    Optimizes the sigma parameter using a high-speed Monotonic Hybrid system.
     
-    # =========================================================================
-    # DYNAMIC PHYSICAL BYPASS:
-    # If the solid core accounts for the entire heavy element budget of this 
-    # specific track, force the sigma=0.0 adiabatic fallback.
-    # =========================================================================
+    Corrected: The try/except block now wraps both Phase 1 and Phase 2 to 
+    ensure early exits are caught regardless of when they occur.
+    """
+    import fuzzycore.eos as eos
+    from scipy.optimize import brentq
+    
+    # Custom signal for early exit
+    class ConvergenceSuccess(Exception):
+        def __init__(self, sigma): self.sigma = sigma
+
     if m_core >= target_mz_me - 0.01: 
-        return 0.0  
+        return 0.0 
 
-    def mz_error(sig: float) -> float:
-        p = get_params(m_core, sig)
-        # Suppress CSV writing during root-finding using os.devnull
-        res = solver.solve_structure(
-            M_KEPLER11E, p, 'mass', 'opt_temp', os.devnull, lock
-        )
+    def eval_sigma(sig_guess: float) -> float:
+        """Evaluates planet and raises ConvergenceSuccess if threshold is met."""
+        p = get_params(m_core, sig_guess)
+        res = solver.solve_structure(M_KEPLER11E, p, 'mass', 'opt_temp', os.devnull, lock)
+        eos._MIXED_CACHE.clear()
+
         if res is None:
-            return 1e6  # Heavy penalty for unphysical regions
+            raise ValueError("Unphysical: Planet Unbound")
             
-        actual_mz = res.get('M_Z_total', m_core * c.M_EARTH)
-        return abs(actual_mz - target_mz_kg)
+        actual_mz_me = res.get('M_Z_total', m_core * c.M_EARTH) / c.M_EARTH
+        error = actual_mz_me - target_mz_me
+        
+        print(f"        [Eval] Sigma: {sig_guess:.4f} | Err: {error:+.4f} M_E")
 
-    # Search for the optimal sigma, allowing it to get extremely sharp
-    res = minimize_scalar(
-        mz_error, bounds=(1e-4, 0.90), method='bounded', options={'xatol': 0.005}
-    )
-    return float(res.x)
+        # --- THE STOPPING THRESHOLD ---
+        if abs(error) < 0.005:
+            raise ConvergenceSuccess(sig_guess)
+            
+        return error
+
+    # WRAP EVERYTHING in the success handler
+    try:
+        # =========================================================================
+        # PHASE 1: MONOTONIC SCOUT
+        # =========================================================================
+        sig_low = 0.0
+        try:
+            err_low = eval_sigma(sig_low)
+            if err_low > 0: return sig_low 
+        except ValueError:
+            raise ValueError("Planet physically unbound even at minimum envelope.")
+
+        sig_high_guesses = [1, 0.5, 0.25, 0.15, 0.08, 0.04, 0.02, 0.001]
+        sig_high = None
+        
+        for guess in sig_high_guesses:
+            try:
+                err_high = eval_sigma(guess)
+                if err_high > 0:
+                    sig_high = guess
+                    break 
+                else:
+                    # If highest stable sigma is still too metal-poor, abort.
+                    raise ValueError(f"Target unreachable: Max stable Z-mass is {target_mz_me + err_high:.2f} M_E")
+            except ValueError as e:
+                if "Unphysical" in str(e):
+                    print(f"      [Scout] Sigma {guess:.4f} is unphysical. Trying sharper...")
+                    continue
+                raise e
+
+        if sig_high is None:
+            raise ValueError("Target mass unreachable: No stable configuration holds enough metal.")
+
+        # =========================================================================
+        # PHASE 2: BRENT'S METHOD
+        # =========================================================================
+        print(f"      [Hybrid] Bracket secured: [{sig_low:.4f}, {sig_high:.4f}]. Sniping root...")
+        final_sigma = brentq(eval_sigma, sig_low, sig_high, xtol=1e-6)
+        return float(final_sigma)
+
+    except ConvergenceSuccess as success:
+        # This catches early exits from Phase 1 AND Phase 2
+        print(f"    -> [Hybrid] Physical convergence reached at Sigma: {success.sigma:.4f}")
+        return success.sigma
 
 
 def run_single_model(args: tuple, lock) -> tuple:
@@ -131,6 +182,7 @@ def run_single_model(args: tuple, lock) -> tuple:
             
             # STRICT GATEKEEPER: Check against the dynamic target
             if mode_type == 'Direct':
+                # RELAXED from 0.01 to 0.05 to account for numerical integration noise
                 if abs(m_z_tot_me - target_mz_me) > 0.05:
                     error_msg = f"Discarded: Conservation failed (M_z = {m_z_tot_me:.2f} vs Target {target_mz_me:.2f})"
                     return False, m_core, track_name, error_msg
@@ -168,9 +220,10 @@ if __name__ == '__main__':
     # Define all the evolutionary tracks you want to explore
     TRACKS = [
         {"name": "Bulk Envelope Transfer", "type": "Bulk", "target_mz_me": 7.9},
-        {"name": "Direct Metal (Total Z = 7.9 M_E)", "type": "Direct", "target_mz_me": 7.9},
+        {"name": "Direct Metal (Total Z = 7.9 M_E)", "type": "Direct", "target_mz_me": 7.5},
         {"name": "Direct Metal (Total Z = 7.0 M_E)", "type": "Direct", "target_mz_me": 7.0},
         {"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
+        {"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 5.0},
     ]
     
     # Checkpoint Logic
@@ -202,7 +255,7 @@ if __name__ == '__main__':
         else:
             mass_grid = np.concatenate([
                 np.linspace(t_mz, t_mz - 0.5, 8),   
-                np.linspace(t_mz - 1.0, 2.0, 10)    
+                np.linspace(t_mz - 1.0, 1.0, 20)    
             ])
             
         for m in mass_grid:
@@ -214,9 +267,9 @@ if __name__ == '__main__':
     # Parallel Execution
     if tasks_to_run:
         # Re-enabled multiprocessing to speed up the multiple tracks
-        n_workers = min(mp.cpu_count() - 1, 6)
+        n_workers = min(mp.cpu_count() - 1, 4)
         n_workers = max(1, n_workers) 
-        n_workers = 1
+        #n_workers = 3
         
         print(f"[*] Starting parallel execution with {n_workers} workers...")
         manager = mp.Manager()
