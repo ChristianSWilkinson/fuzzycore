@@ -150,10 +150,11 @@ def calculate_staircase_dt_ds(results: dict, t_int: float) -> dict:
     compositional (Z) layers. It returns both the global homologous cooling 
     rate and a breakdown of the thermal inertia contributed by each layer.
     Uses exact mass differentials to avoid numerical integration artifacts.
+    Explicitly excludes the solid core by masking regions where Entropy (S) == 0.
 
     Args:
         results (dict): The converged planetary structure dictionary. Must 
-            contain 'R', 'T', 'M', and 'Z'.
+            contain 'R', 'T', 'M', 'Z', and 'S'.
         t_int (float): The internal effective temperature driving the cooling 
             luminosity (in Kelvin).
 
@@ -167,6 +168,7 @@ def calculate_staircase_dt_ds(results: dict, t_int: float) -> dict:
     temp_array = results['T']
     mass_array = results['M']
     z_array = results['Z']
+    s_array = results['S']  # Pull the entropy array
 
     radius_planet = radius_array[-1]
 
@@ -179,22 +181,31 @@ def calculate_staircase_dt_ds(results: dict, t_int: float) -> dict:
     # Exact mass of each discrete spherical shell
     dm = np.diff(mass_array)
 
-    # Approximate average temperature of the shell
+    # Approximate average properties of the shell
     t_shell = (temp_array[:-1] + temp_array[1:]) / 2.0
-
-    # Evaluate the integrand: T(r) * (dm / 4*pi)
-    integrand = t_shell * (dm / (4 * np.pi))
-
-    # Classify shells by their outer edge Z
     z_shell = z_array[1:]
-    unique_z = np.unique(z_shell)
+    s_shell = s_array[1:]
+
+    # 🚨 THE FIX: Mask out the core! 
+    # Since integrate_core explicitly assigns S = 0.0 to the core, 
+    # we only integrate shells where the entropy is strictly positive.
+    env_mask = s_shell > 0.0
+
+    # Apply the mask to isolate envelope properties
+    dm_env = dm[env_mask]
+    t_shell_env = t_shell[env_mask]
+    z_shell_env = z_shell[env_mask]
+
+    # Evaluate the integrand strictly for the envelope: T(r) * (dm / 4*pi)
+    integrand = t_shell_env * (dm_env / (4 * np.pi))
+    unique_z = np.unique(z_shell_env)
 
     layer_contributions = {}
     total_dt_ds = 0.0
 
     # Integrate layer-by-layer
     for z_val in unique_z:
-        mask = np.isclose(z_shell, z_val, atol=1e-4)
+        mask = np.isclose(z_shell_env, z_val, atol=1e-4)
 
         layer_integral = np.sum(integrand[mask])
 

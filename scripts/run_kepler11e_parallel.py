@@ -112,7 +112,7 @@ def find_conserved_sigma(m_core: float, target_mz_me: float, lock) -> float:
         except ValueError:
             raise ValueError("Planet physically unbound even at minimum envelope.")
 
-        sig_high_guesses = [1, 0.5, 0.25, 0.15, 0.08, 0.04, 0.02, 0.001]
+        sig_high_guesses = [5.0, 3.0, 2.0, 1.0, 0.5, 0.25, 0.15, 0.08, 0.04, 0.02, 0.001]
         sig_high = None
         
         for guess in sig_high_guesses:
@@ -220,10 +220,10 @@ if __name__ == '__main__':
     # Define all the evolutionary tracks you want to explore
     TRACKS = [
         {"name": "Bulk Envelope Transfer", "type": "Bulk", "target_mz_me": 7.9},
-        {"name": "Direct Metal (Total Z = 7.9 M_E)", "type": "Direct", "target_mz_me": 7.5},
-        {"name": "Direct Metal (Total Z = 7.0 M_E)", "type": "Direct", "target_mz_me": 7.0},
-        {"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
-        {"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 5.0},
+        #{"name": "Direct Metal (Total Z = 7.5 M_E)", "type": "Direct", "target_mz_me": 7.5},
+        #{"name": "Direct Metal (Total Z = 7.0 M_E)", "type": "Direct", "target_mz_me": 7.0},
+        #{"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
+        #{"name": "Direct Metal (Total Z = 5.0 M_E)", "type": "Direct", "target_mz_me": 5.0},
     ]
     
     # Checkpoint Logic
@@ -250,7 +250,7 @@ if __name__ == '__main__':
         if t_type == 'Bulk':
             mass_grid = np.concatenate([
                 np.linspace(t_mz, t_mz - 0.4, 8),   
-                np.linspace(t_mz - 0.5, 2.0, 10)    
+                np.linspace(t_mz - 0.5, 0.0, 10)    
             ])
         else:
             mass_grid = np.concatenate([
