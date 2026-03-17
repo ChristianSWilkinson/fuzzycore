@@ -54,8 +54,9 @@ def get_params(m_core: float, sigma: float) -> dict:
         'M_rock': m_core * c.M_EARTH,   
         'M_water': 0.0,                 
         'P_surf': 1.0,
-        'T_surf': 900.0,                
-        'z_base': 0.05,                 
+        'T_surf': 900.0,  
+        'T_int': 150.0,              
+        'z_base': 0.02,                 
         'z_profile': np.round(z_prof, 2), 
         'sigma_val': sigma,              
         'iron_fraction': 0.33,          
@@ -220,10 +221,10 @@ if __name__ == '__main__':
     # Define all the evolutionary tracks you want to explore
     TRACKS = [
         {"name": "Bulk Envelope Transfer", "type": "Bulk", "target_mz_me": 7.9},
-        #{"name": "Direct Metal (Total Z = 7.5 M_E)", "type": "Direct", "target_mz_me": 7.5},
-        #{"name": "Direct Metal (Total Z = 7.0 M_E)", "type": "Direct", "target_mz_me": 7.0},
-        #{"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
-        #{"name": "Direct Metal (Total Z = 5.0 M_E)", "type": "Direct", "target_mz_me": 5.0},
+        {"name": "Direct Metal (Total Z = 7.5 M_E)", "type": "Direct", "target_mz_me": 7.5},
+        {"name": "Direct Metal (Total Z = 7.0 M_E)", "type": "Direct", "target_mz_me": 7.0},
+        {"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
+        {"name": "Direct Metal (Total Z = 5.0 M_E)", "type": "Direct", "target_mz_me": 5.0},
     ]
     
     # Checkpoint Logic
