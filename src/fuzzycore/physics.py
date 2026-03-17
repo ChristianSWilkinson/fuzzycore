@@ -369,6 +369,11 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
         "Z": np.concatenate([core_res['Z'], water_Z]),
         "R_rock": R_rock, "R_int": R_water_top
     }
+
+    t_eff = params.get('T_int', params.get('T_surf', 500.0))
+    c_info = utils.calculate_staircase_dt_ds(result, t_eff)
+    result["dt_ds_total"] = c_info['total_dt_ds']
+    result["dt_ds_layers"] = c_info['layer_contributions']
     
     return result
 
