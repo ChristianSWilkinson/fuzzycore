@@ -144,31 +144,18 @@ class DummyLock:
 
 def calculate_staircase_dt_ds(results: dict, t_int: float) -> dict:
     """
-    Calculate the inverse cooling rate (dt/dS) for a non-adiabatic staircase.
-
-    This expands the thermal integral by grouping the interior into discrete 
-    compositional (Z) layers. It returns both the global homologous cooling 
-    rate and a breakdown of the thermal inertia contributed by each layer.
-    Uses exact mass differentials to avoid numerical integration artifacts.
-    Explicitly excludes the solid core by masking regions where Entropy (S) == 0.
-
-    Args:
-        results (dict): The converged planetary structure dictionary. Must 
-            contain 'R', 'T', 'M', 'Z', and 'S'.
-        t_int (float): The internal effective temperature driving the cooling 
-            luminosity (in Kelvin).
-
-    Returns:
-        dict: A dictionary containing:
-            - 'total_dt_ds' (float): The global inverse cooling rate.
-            - 'layer_contributions' (dict): A mapping of Z-fraction to its 
-              specific contribution to dt/dS.
+    Calculate the effective inverse cooling rate (dt/dS) for the planet.
+    This calculates the bulk thermal inertia of the fluid envelope, and 
+    adds the parameterized thermal inertia of the solid core.
     """
+    import numpy as np
+    from . import constants as c
+
     radius_array = results['R']
     temp_array = results['T']
     mass_array = results['M']
     z_array = results['Z']
-    s_array = results['S']  # Pull the entropy array
+    s_array = results['S'] 
 
     radius_planet = radius_array[-1]
 
@@ -178,44 +165,149 @@ def calculate_staircase_dt_ds(results: dict, t_int: float) -> dict:
     if denominator <= 0:
         return {'total_dt_ds': np.inf, 'layer_contributions': {}}
 
-    # Exact mass of each discrete spherical shell
+    # -------------------------------------------------------------------------
+    # 1. ENVELOPE CONTRIBUTION (Fluid thermal inertia)
+    # -------------------------------------------------------------------------
     dm = np.diff(mass_array)
-
-    # Approximate average properties of the shell
     t_shell = (temp_array[:-1] + temp_array[1:]) / 2.0
     z_shell = z_array[1:]
     s_shell = s_array[1:]
 
-    # 🚨 THE FIX: Mask out the core! 
-    # Since integrate_core explicitly assigns S = 0.0 to the core, 
-    # we only integrate shells where the entropy is strictly positive.
+    # Mask to isolate the fluid envelope
     env_mask = s_shell > 0.0
 
-    # Apply the mask to isolate envelope properties
     dm_env = dm[env_mask]
     t_shell_env = t_shell[env_mask]
     z_shell_env = z_shell[env_mask]
 
-    # Evaluate the integrand strictly for the envelope: T(r) * (dm / 4*pi)
     integrand = t_shell_env * (dm_env / (4 * np.pi))
     unique_z = np.unique(z_shell_env)
 
     layer_contributions = {}
     total_dt_ds = 0.0
 
-    # Integrate layer-by-layer
     for z_val in unique_z:
         mask = np.isclose(z_shell_env, z_val, atol=1e-4)
-
         layer_integral = np.sum(integrand[mask])
-
-        # Apply the minus sign required by the energy balance equation
         layer_dt_ds = -(layer_integral / denominator)
 
         layer_contributions[z_val] = layer_dt_ds
         total_dt_ds += layer_dt_ds
 
+    # -------------------------------------------------------------------------
+    # 2. SOLID CORE CONTRIBUTION (Lumped Heat Capacity)
+    # -------------------------------------------------------------------------
+    m_core = results.get('M_core_actual', 0.0)
+    
+    if m_core > 0:
+        # 🛑 THE FIX: Slice temp_array[1:] to match the N-1 shell-based mask!
+        # This correctly retrieves the temperature at the outer edge of the core.
+        t_core_surface = temp_array[1:][~env_mask][-1] if not np.all(env_mask) else temp_array[0]
+        
+        # Specific heat capacity of Rock/Iron mix (approx 800 J/kg/K)
+        cv_core = 800.0 
+        
+        # Scale core thermal inertia relative to gas c_p (~14000 J/kg/K)
+        effective_core_weight = cv_core / 14000.0
+        
+        core_integral = t_core_surface * effective_core_weight * (m_core / (4 * np.pi))
+        core_dt_ds = -(core_integral / denominator)
+        
+        layer_contributions['Core'] = core_dt_ds
+        total_dt_ds += core_dt_ds
+
     return {
         'total_dt_ds': total_dt_ds,
         'layer_contributions': layer_contributions
+    }
+
+
+def verify_ddc_macroscopic_gradient(
+    results: dict, 
+    t_int: float, 
+    lambda_cd: float = 10.0,  # Thermal conductivity (W / m K)
+    Ra_T: float = 1e8,        # Modified Thermal Rayleigh Number
+    l_H: float = 0.1          # Characteristic mixing length ratio
+) -> dict:
+    """
+    Validates the fuzzycore artificial staircase gradient against the 
+    theoretical Double-Diffusive Convection (DDC) scaling laws (Wood et al. 2013).
+    """
+    from . import constants as c
+    
+    R = results['R']
+    T = results['T']
+    Z = results['Z']
+    
+    # -------------------------------------------------------------------------
+    # 1. Extract the Model's Macroscopic Gradient
+    # -------------------------------------------------------------------------
+    # Isolate the exact radial boundaries of the "Fuzzy Core" 
+    # (Where the heavy element mass fraction Z is actively changing)
+    z_diff = np.abs(np.diff(Z))
+    changing_indices = np.where(z_diff > 1e-5)[0]
+    
+    if len(changing_indices) < 2:
+        return {'valid': False, 'error': "No macroscopic compositional gradient detected."}
+        
+    idx_bot = changing_indices[0]
+    idx_top = changing_indices[-1]
+    
+    delta_r_macro = R[idx_top] - R[idx_bot]
+    delta_T_macro = T[idx_top] - T[idx_bot]
+    
+    # <dT/dr>_fuzzy (Note: R goes outward, so T drops, yielding a negative gradient)
+    grad_fuzzy = delta_T_macro / delta_r_macro
+    
+    # -------------------------------------------------------------------------
+    # 2. Calculate Theoretical DDC Nusselt Number
+    # -------------------------------------------------------------------------
+    # Empirical relation from Wood et al. (2013)
+    Nu_T = 0.02 * Ra_T * (l_H ** 0.34) + 1.0
+    
+    # -------------------------------------------------------------------------
+    # 3. Define the Physical Flux Equation & Local Adiabat
+    # -------------------------------------------------------------------------
+    # Extract total intrinsic luminosity (L) and local heat flux (F_tot)
+    R_surf = R[-1]
+    L_tot = c.SIGMA_SB * (R_surf ** 2) * (t_int ** 4) * 4 * np.pi
+    r_mean = (R[idx_top] + R[idx_bot]) / 2.0
+    F_tot = L_tot / (4 * np.pi * (r_mean ** 2))
+    
+    # Extract the pure adiabatic gradient <dT/dr>_ad natively from the EOS!
+    # We do this by evaluating a spatial step INSIDE a single constant-Z layer,
+    # where the fuzzycore integrator is strictly adiabatic by definition.
+    grad_ad_list = []
+    for i in range(idx_bot, idx_top):
+        if np.isclose(Z[i], Z[i+1], atol=1e-5):  # Inside a single layer
+            dr = R[i+1] - R[i]
+            if dr > 1e-3:  # Prevent divide-by-zero
+                grad_ad_list.append((T[i+1] - T[i]) / dr)
+                
+    if not grad_ad_list:
+        raise ValueError("Grid resolution too low to extract a pure adiabatic segment.")
+        
+    grad_ad = np.mean(grad_ad_list)
+        
+    # -------------------------------------------------------------------------
+    # 4. Solve for the Theoretical DDC Gradient
+    # -------------------------------------------------------------------------
+    # Inverting the total flux equation: 
+    # F_tot = -lambda_cd * ( <dT/dr>_DDC - <dT/dr>_ad ) * Nu_T + ...
+    grad_ddc = ( -(F_tot / lambda_cd) + (Nu_T - 1) * grad_ad ) / Nu_T
+    
+    # -------------------------------------------------------------------------
+    # 5. The Verification Proof
+    # -------------------------------------------------------------------------
+    # A perfect physical match yields a ratio of exactly 1.0
+    match_ratio = grad_fuzzy / grad_ddc
+    
+    return {
+        'valid': True,
+        'grad_fuzzy': grad_fuzzy,
+        'grad_ddc': grad_ddc,
+        'grad_ad': grad_ad,
+        'Nu_T': Nu_T,
+        'F_tot': F_tot,
+        'match_ratio': match_ratio
     }

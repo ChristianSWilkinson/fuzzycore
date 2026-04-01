@@ -29,6 +29,22 @@ def save_plot(fig, name):
     print(f"Figure saved to: {path}")
 
 
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+from . import constants as c
+from . import eos
+
+def save_plot(fig, name):
+    # Assumes your save_plot function remains exactly as is
+    folder = "../figures/"
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    path = os.path.join(folder, f"{name}.pdf")
+    fig.savefig(path, bbox_inches='tight', dpi=300)
+    print(f"Figure saved to: {path}")
+
+
 def plot_diagnostics(results, save_name="structure_diagnostics"):
     """
     Generates a 6-panel diagnostic suite for Rock-Water-Gas architectures.
@@ -40,7 +56,7 @@ def plot_diagnostics(results, save_name="structure_diagnostics"):
     Args:
         results (dict): Dictionary containing the planetary integration results 
             (must include 'R', 'M', 'P', 'T', 'Z', 'Rho', 'S', and optionally
-            'R_int', 'R_rock').
+            'R_int', 'R_rock', 'M_water').
         save_name (str, optional): The filename for saving the output plot. 
             Defaults to "structure_diagnostics".
     """
@@ -64,6 +80,7 @@ def plot_diagnostics(results, save_name="structure_diagnostics"):
     # R_int marks the water-envelope boundary; R_rock marks the rock-water boundary
     R_int = results.get('R_int')
     R_rock = results.get('R_rock')
+    has_water = results.get('M_water', 0.0) > 0.0
 
     # Normalize boundaries relative to total radius
     R_int_norm = (R_int / R_total) if R_int is not None else None
@@ -76,9 +93,6 @@ def plot_diagnostics(results, save_name="structure_diagnostics"):
     def shade(ax):
         """
         Applies dynamic background shading to a subplot based on planetary zones.
-        
-        Args:
-            ax (matplotlib.axes.Axes): The axes object to apply shading to.
         """
         # Determine the rock boundary (defaults to R_int for gas giants w/o water)
         rock_boundary = R_rock_norm if R_rock_norm is not None else R_int_norm
@@ -86,18 +100,20 @@ def plot_diagnostics(results, save_name="structure_diagnostics"):
         # Shade the Rock Zone
         if rock_boundary is not None:
             ax.axvspan(0, rock_boundary, color='saddlebrown', alpha=0.3)
+            # va='bottom' keeps the text just above the x-axis so it doesn't get lost
             ax.text(
                 rock_boundary / 2, 
                 ax.get_ylim()[0], 
                 "ROCK", 
                 color='saddlebrown', 
                 ha='center', 
+                va='bottom',
                 fontweight='bold', 
                 fontsize=9
             )
 
-        # Shade the Water Zone (Only if a distinct water mantle exists)
-        if R_rock_norm is not None and R_int_norm is not None:
+        # Shade the Water Zone (Only if M_water is > 0 and distinct boundaries exist)
+        if has_water and R_rock_norm is not None and R_int_norm is not None:
             ax.axvspan(R_rock_norm, R_int_norm, color='dodgerblue', alpha=0.2)
             ax.text(
                 (R_rock_norm + R_int_norm) / 2, 
@@ -105,46 +121,53 @@ def plot_diagnostics(results, save_name="structure_diagnostics"):
                 "WATER", 
                 color='dodgerblue', 
                 ha='center', 
+                va='bottom',
                 fontweight='bold', 
                 fontsize=9
             )
 
+    # Label styling dict to keep code clean and space efficient
+    label_style = {'fontsize': 11, 'labelpad': 2}
+
     # Panel 0: Density (highlights rock/water plateaus)
     axes[0].plot(R_norm, Rho / 1000.0, 'k-', lw=2)
-    axes[0].set_title("Density [g/cm3]")
+    axes[0].set_ylabel(r"Density [g/cm$^3$]", **label_style)
     shade(axes[0])
 
     # Panel 1: Mass Distribution
     axes[1].plot(R_norm, M / c.M_EARTH, 'b-', lw=2)
-    axes[1].set_title(f"Total Mass: {M[-1] / c.M_EARTH:.2f} M_E")
+    axes[1].set_ylabel(r"Mass [$M_\oplus$]", **label_style)
+    axes[1].set_title(f"Total Mass: {M[-1] / c.M_EARTH:.2f} $M_\\oplus$", fontsize=12)
     shade(axes[1])
 
     # Panel 2: Temperature (Log Scale required for atmospheric gradients)
     axes[2].plot(R_norm, T, 'orange', lw=2)
     axes[2].set_yscale('log')
-    axes[2].set_title("Temperature [K]")
+    axes[2].set_ylabel("Temperature [K]", **label_style)
     shade(axes[2])
 
     # Panel 3: Compositional Profile
     axes[3].plot(R_norm, Z, 'c-', lw=2)
-    axes[3].set_title("Water Mass Fraction Z")
+    axes[3].set_ylabel("Heavy Element Frac. (Z)", **label_style)
     shade(axes[3])
 
     # Panel 4: P-T Profile (Internal Adiabat Phase Space)
     axes[4].plot(P, np.log10(T), 'purple', lw=2)
     axes[4].invert_xaxis()  # Deepest pressure on the right
-    axes[4].set_title("Internal P-T Profile")
-    axes[4].set_xlabel("log10 P [bar]")
+    axes[4].set_ylabel(r"$\log_{10}$ T [K]", **label_style)
+    axes[4].set_xlabel(r"$\log_{10}$ P [bar]", **label_style)
 
     # Panel 5: Entropy (Reveals layered convective jumps)
+    # Note: Entropy is usually in J/kg/K in most planetary EOS models
     axes[5].plot(R_norm, S, 'm-', lw=2)
-    axes[5].set_title("Entropy Profile")
+    axes[5].set_ylabel("Entropy [J/kg/K]", **label_style)
     shade(axes[5])
 
     # Set common X-axis labels for radial plots
     for ax in [axes[0], axes[1], axes[2], axes[3], axes[5]]:
-        ax.set_xlabel(r"Relative Radius ($r/R_{total}$)")
+        ax.set_xlabel(r"Relative Radius ($r/R_{total}$)", **label_style)
 
+    # tight_layout automatically prevents the new y-labels from overlapping adjacent subplots
     plt.tight_layout()
     save_plot(fig, save_name)
     plt.show()

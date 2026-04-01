@@ -120,9 +120,13 @@ def solve_structure(target_val: float, params: dict, mode: str,
         and returns the error relative to the target mass/gravity.
         """
         # Truncate slightly to prevent floating point cache misses
-        log_pc_rounded = round(float(log_pc), 5)
+        log_pc_rounded = round(float(log_pc), 12)
         if log_pc_rounded in eval_cache:
             return eval_cache[log_pc_rounded]
+
+        # 🛑 TRIPWIRE: Announce the attempt
+        if params.get('debug'):
+            print(f"\n    [Objective Attempt] logPc: {log_pc:.4f} (Pc: {10**log_pc:.2e} bar)")
 
         try:
             if is_water_world:
@@ -134,15 +138,18 @@ def solve_structure(target_val: float, params: dict, mode: str,
             
             # --- FAIL CRITERIA ---
             if res is None or np.isnan(res['M'][-1]):
-                # 🛑 INSTEAD of a violent -1e30 crash, return the bare interior mass.
-                # This tells the root-finder: "At this pressure, you get exactly 0 envelope."
-                # It creates a perfectly smooth, physical slope for Brentq to follow!
+                # 🛑 THE FIX: Add a tiny artificial slope based on log_pc 
+                # This prevents brentq from dividing by zero on a flat plateau
+                slope_assist = log_pc * 0.0001  
+                
                 if mode == 'mass':
-                    error = interior_mass - target_val 
+                    error = (interior_mass - target_val) + slope_assist
                 else:
-                    # Approximate gravity of a bare rock to keep the gradient smooth
                     approx_r = (interior_mass / ( (4/3)*np.pi * 5000 ))**(1/3)
-                    error = (c.G_CONST * interior_mass / approx_r**2) - target_val
+                    error = (c.G_CONST * interior_mass / approx_r**2) - target_val + slope_assist
+                
+                if params.get('debug'):
+                    print(f"      ❌ FAILURE: Integration returned None (Unbound) | Fallback Error: {error/c.M_EARTH:+.3f} Me")
                     
             elif res['M'][-1] < (interior_mass * 0.99):
                 # Same fallback if the integration stopped prematurely
@@ -151,6 +158,9 @@ def solve_structure(target_val: float, params: dict, mode: str,
                 else:
                     approx_r = (interior_mass / ( (4/3)*np.pi * 5000 ))**(1/3)
                     error = (c.G_CONST * interior_mass / approx_r**2) - target_val
+
+                if params.get('debug'):
+                    print(f"      ❌ FAILURE: Integration Prematurely Stalled | Fallback Error: {error/c.M_EARTH:+.3f} Me")
                     
             else:
                 actual_m = res['M'][-1]
@@ -186,23 +196,16 @@ def solve_structure(target_val: float, params: dict, mode: str,
                     error = actual_m - target_val
                     current_val = actual_m
                     unit = "kg"
+                
+                if params.get('debug'):
+                    print(f"      ✅ SUCCESS: Mass Achieved: {actual_m/c.M_EARTH:.3f} Me | Error: {error/c.M_EARTH:+.3f} Me")
             
-            # --- 🛑 NEW VERBOSITY INJECTION ---
-            if params.get('debug', False):
-                # Check if it was a bare-rock fallback
-                if res is None or np.isnan(res['M'][-1]) or res['M'][-1] < (interior_mass * 0.99):
-                    print(f"  [Solver Eval] logPc: {log_pc:.4f} | ⚠️ FALLBACK (Env Failed) | Error: {error:.4e}", flush=True)
-                else:
-                    # Print exact tracking metrics
-                    print(f"  [Solver Eval] logPc: {log_pc:.4f} | Current: {current_val:.4e} {unit} | Target: {target_val:.4e} {unit} | Delta: {error:+.4e}", flush=True)
-            # ----------------------------------
-
             eval_cache[log_pc_rounded] = error
             return error
                 
         except Exception as e:
             if params.get('debug'):
-                print(f"  [Solver] Error at logPc {log_pc:.2f}: {e}")
+                print(f"      💥 CRASH in Objective: {str(e)}")
             eval_cache[log_pc_rounded] = 1e30
             return 1e30
 
@@ -213,8 +216,8 @@ def solve_structure(target_val: float, params: dict, mode: str,
     # Vastly relaxed bounds. Thin envelopes require wildly varied central pressures.
     m_core_earth = params.get('M_rock', params.get('M_core', 5.0)) / c.M_EARTH
     
-    if m_core_earth < 2.0: min_pc, max_pc = 4.5, 11.0
-    elif m_core_earth < 10.0: min_pc, max_pc = 5.5, 13.0
+    if m_core_earth < 2.0: min_pc, max_pc = 4.5, 9.0
+    elif m_core_earth < 10.0: min_pc, max_pc = 5.5, 11.0
     elif m_core_earth < 50.0: min_pc, max_pc = 6.5, 14.5
     else: min_pc, max_pc = 7.5, 15.5
 
@@ -281,6 +284,8 @@ def solve_structure(target_val: float, params: dict, mode: str,
                 for i in range(len(valid_evals) - 1):
                     if np.sign(valid_evals[i][1]) != np.sign(valid_evals[i+1][1]):
                         bracket = (valid_evals[i][0], valid_evals[i+1][0])
+                        if params.get('debug'):
+                            print(f"    🌟 BRACKET SECURED: [{bracket[0]:.4f}, {bracket[1]:.4f}]")
                         break
         if bracket:
             if params.get('debug'):
@@ -312,7 +317,7 @@ def solve_structure(target_val: float, params: dict, mode: str,
     try:
         if bracket:
             # Brentq is super fast because the bracket bounds are loaded from the eval_cache!
-            root = brentq(objective, bracket[0], bracket[1], xtol=1e-4)
+            root = brentq(objective, bracket[0], bracket[1], xtol=1e-7)
             
             if is_water_world:
                 return physics.integrate_water_world(root, params, eos_data)

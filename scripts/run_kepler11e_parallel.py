@@ -37,8 +37,6 @@ import fuzzycore.eos as eos
 M_KEPLER11E: float = 7.95 * c.M_EARTH
 
 RESULTS_FILE: str = "../data/kepler11e_sweep_results.csv"
-TEMP_FILE: str = "../data/kepler11e_sweep_temp.csv"
-
 
 # =============================================================================
 # PARALLEL WORKER FUNCTIONS
@@ -47,7 +45,7 @@ TEMP_FILE: str = "../data/kepler11e_sweep_temp.csv"
 def get_params(m_core: float, sigma: float) -> dict:
     """Helper to generate the standard parameter dictionary."""
     z_prof = utils.generate_gaussian_z_profile(
-        n_layers=30, sigma=sigma, z_base=0.02, z_core=0.99
+        n_layers=50, sigma=sigma, z_base=0.02, z_core=0.99
     )
     return {
         'M_core': m_core * c.M_EARTH,   
@@ -55,26 +53,24 @@ def get_params(m_core: float, sigma: float) -> dict:
         'M_water': 0.0,                 
         'P_surf': 1.0,
         'T_surf': 900.0,  
-        'T_int': 150.0,              
+        'T_int': 300.0,              
         'z_base': 0.02,                 
-        'z_profile': np.round(z_prof, 2), 
+        'z_profile': z_prof,             # Unrounded, continuous profile as requested
         'sigma_val': sigma,              
         'iron_fraction': 0.33,          
-        'debug': False
+        'debug': True,
+        'initial_log_pc': 7
     }
 
 
-def find_conserved_sigma(m_core: float, target_mz_me: float, lock) -> float:
+def find_conserved_sigma(m_core: float, target_mz_me: float, lock, hint_sigma: float = None) -> float:
     """
-    Optimizes the sigma parameter using a high-speed Monotonic Hybrid system.
-    
-    Corrected: The try/except block now wraps both Phase 1 and Phase 2 to 
-    ensure early exits are caught regardless of when they occur.
+    Optimizes the sigma parameter using a robust array-based scouting system.
+    Safely bypasses discontinuous runaway-gas cliffs at low sigma values.
     """
     import fuzzycore.eos as eos
     from scipy.optimize import brentq
     
-    # Custom signal for early exit
     class ConvergenceSuccess(Exception):
         def __init__(self, sigma): self.sigma = sigma
 
@@ -88,107 +84,138 @@ def find_conserved_sigma(m_core: float, target_mz_me: float, lock) -> float:
         eos._MIXED_CACHE.clear()
 
         if res is None:
-            raise ValueError("Unphysical: Planet Unbound")
+            raise ValueError("Unphysical: Planet Unbound or on Runaway Cliff")
             
         actual_mz_me = res.get('M_Z_total', m_core * c.M_EARTH) / c.M_EARTH
         error = actual_mz_me - target_mz_me
         
         print(f"        [Eval] Sigma: {sig_guess:.4f} | Err: {error:+.4f} M_E")
 
-        # --- THE STOPPING THRESHOLD ---
         if abs(error) < 0.005:
             raise ConvergenceSuccess(sig_guess)
             
         return error
 
-    # WRAP EVERYTHING in the success handler
     try:
         # =========================================================================
-        # PHASE 1: MONOTONIC SCOUT
+        # PHASE 0: FAST-TRACK WARM START
         # =========================================================================
-        sig_low = 0.0
-        try:
-            err_low = eval_sigma(sig_low)
-            if err_low > 0: return sig_low 
-        except ValueError:
-            raise ValueError("Planet physically unbound even at minimum envelope.")
-
-        sig_high_guesses = [5.0, 3.0, 2.0, 1.0, 0.5, 0.25, 0.15, 0.08, 0.04, 0.02, 0.001]
-        sig_high = None
-        
-        for guess in sig_high_guesses:
+        if hint_sigma is not None and hint_sigma > 0.0:
+            print(f"      [Fast-Track] Testing bracket around hint sigma: {hint_sigma:.4f}")
             try:
-                err_high = eval_sigma(guess)
-                if err_high > 0:
-                    sig_high = guess
-                    break 
-                else:
-                    # If highest stable sigma is still too metal-poor, abort.
-                    raise ValueError(f"Target unreachable: Max stable Z-mass is {target_mz_me + err_high:.2f} M_E")
-            except ValueError as e:
-                if "Unphysical" in str(e):
-                    print(f"      [Scout] Sigma {guess:.4f} is unphysical. Trying sharper...")
-                    continue
-                raise e
-
-        if sig_high is None:
-            raise ValueError("Target mass unreachable: No stable configuration holds enough metal.")
+                sl = max(0.001, hint_sigma * 0.4)
+                sh = min(3.0, hint_sigma * 2.5)
+                
+                err_l = eval_sigma(sl)
+                err_h = eval_sigma(sh)
+                
+                if np.sign(err_l) != np.sign(err_h):
+                    print(f"      [Fast-Track] Bracket secured: [{sl:.4f}, {sh:.4f}].")
+                    return float(brentq(eval_sigma, sl, sh, xtol=1e-6))
+            except Exception:
+                print("      [Fast-Track] Hint unstable. Falling back to Phase 1.")
 
         # =========================================================================
-        # PHASE 2: BRENT'S METHOD
+        # PHASE 1: ROBUST ARRAY SCOUTING
         # =========================================================================
-        print(f"      [Hybrid] Bracket secured: [{sig_low:.4f}, {sig_high:.4f}]. Sniping root...")
-        final_sigma = brentq(eval_sigma, sig_low, sig_high, xtol=1e-6)
-        return float(final_sigma)
+        test_sigmas = [0.0, 0.001, 0.01, 0.05, 0.15, 0.25, 0.5, 1.0, 2.0, 3.0]
+        stable_points = []
+        
+        for guess in test_sigmas:
+            try:
+                err = eval_sigma(guess)
+                stable_points.append((guess, err))
+            except ValueError:
+                if get_params(m_core, guess).get('debug'):
+                    print(f"      [Scout] Sigma {guess:.4f} physically unstable (Skipping).")
+                continue
+                
+        if not stable_points:
+            raise ValueError("All tested Sigma values hit runaway cliffs for this core mass.")
+            
+        # =========================================================================
+        # PHASE 2: BRACKET EXTRACTION & BRENTQ
+        # =========================================================================
+        bracket_low = None
+        bracket_high = None
+        
+        for i in range(len(stable_points) - 1):
+            if np.sign(stable_points[i][1]) != np.sign(stable_points[i+1][1]):
+                bracket_low = stable_points[i][0]
+                bracket_high = stable_points[i+1][0]
+                break
+                
+        if bracket_low is not None and bracket_high is not None:
+            print(f"      [Hybrid] Bracket secured: [{bracket_low:.4f}, {bracket_high:.4f}]. Sniping root...")
+            final_sigma = brentq(eval_sigma, bracket_low, bracket_high, xtol=1e-6)
+            return float(final_sigma)
+        else:
+            # Handle edge cases where curve doesn't cross zero within the test domain
+            if all(err < 0 for s, err in stable_points):
+                raise ValueError(f"Target unreachable: Max stable Z-mass is too low even at sigma={stable_points[-1][0]}")
+            elif all(err > 0 for s, err in stable_points):
+                return stable_points[0][0] 
 
     except ConvergenceSuccess as success:
-        # This catches early exits from Phase 1 AND Phase 2
         print(f"    -> [Hybrid] Physical convergence reached at Sigma: {success.sigma:.4f}")
         return success.sigma
-
+    
 
 def run_single_model(args: tuple, lock) -> tuple:
-    """
-    Executes the integration for a specific core mass and transfer mode, 
-    enforcing strict conservation checks based on the track's metal target.
-    """
-    m_core, track_name, mode_type, target_mz_me = args
+    """ Executes the integration and validates against DDC scaling laws. """
+    m_core, track_name, mode_type, target_mz_me, hint_sigma = args
     trial_id = f"K11e_{mode_type}_{target_mz_me}_{m_core:.3f}"
     
+    worker_temp_file = f"../data/temp_{trial_id}.csv"
+    
     try:
-        # Determine the correct sigma based on the physical mode type
         if mode_type == 'Bulk':
-            # Original physics: Fixed sigma shape
-            sigma = 0.25
+            sigma = 0.10
         else:
-            # Direct Metal Transfer: Tune sigma to conserve exact target metals
-            sigma = find_conserved_sigma(m_core, target_mz_me, lock)
+            sigma = find_conserved_sigma(m_core, target_mz_me, lock, hint_sigma=hint_sigma)
             
         params = get_params(m_core, sigma)
         
-        # Final integration with the determined parameters
         res = solver.solve_structure(
             target_val=M_KEPLER11E,
             params=params,
             mode='mass',
             trial_id=trial_id,
-            csv_file=TEMP_FILE,
+            csv_file=worker_temp_file,
             write_lock=lock
         )
+        
+        if os.path.exists(worker_temp_file):
+            try: os.remove(worker_temp_file)
+            except: pass
         
         if res is not None:
             r_tot_re = res['R'][-1] / c.R_EARTH
             m_z_tot_kg = res.get('M_Z_total', m_core * c.M_EARTH)
             m_z_tot_me = m_z_tot_kg / c.M_EARTH
             
-            # STRICT GATEKEEPER: Check against the dynamic target
             if mode_type == 'Direct':
-                # RELAXED from 0.01 to 0.05 to account for numerical integration noise
                 if abs(m_z_tot_me - target_mz_me) > 0.05:
-                    error_msg = f"Discarded: Conservation failed (M_z = {m_z_tot_me:.2f} vs Target {target_mz_me:.2f})"
-                    return False, m_core, track_name, error_msg
+                    return False, m_core, track_name, "Conservation failed"
 
-            # Dilute mass is the total heavy elements minus the solid core
+            # 🛑 THE FIX: Removed 'if mode_type == Direct' restriction!
+            # This now runs for BOTH Bulk and Direct tracks.
+            match_ratio, grad_fuzzy, grad_ddc = np.nan, np.nan, np.nan
+            try:
+                ddc_proof = utils.verify_ddc_macroscopic_gradient(
+                    results=res, 
+                    t_int=params.get('T_int', params['T_surf']), 
+                    lambda_cd=10.0,   
+                    Ra_T=1e8,         
+                    l_H=0.1           
+                )
+                if ddc_proof.get('valid', False):
+                    match_ratio = ddc_proof['match_ratio']
+                    grad_fuzzy = ddc_proof['grad_fuzzy']
+                    grad_ddc = ddc_proof['grad_ddc']
+            except Exception:
+                pass
+
             m_dilute = max(m_z_tot_me - m_core, 0.0)
             
             result_dict = {
@@ -199,13 +226,23 @@ def run_single_model(args: tuple, lock) -> tuple:
                 'M_Z_total_Me': m_z_tot_me,
                 'R_total_Re': r_tot_re,
                 'Sigma_Used': sigma,
-                'dt_ds_total': res.get('dt_ds_total', np.nan)
+                'dt_ds_total': res.get('dt_ds_total', np.nan),
+                'DDC_Match_Ratio': match_ratio, # Now populated for Bulk!
+                'Grad_Fuzzy': grad_fuzzy,
+                'Grad_DDC': grad_ddc
             }
+            
+            proof_str = f" | DDC Proof: {match_ratio:.3f}" if not np.isnan(match_ratio) else ""
+            print(f"  [+] {track_name} | Core: {m_core:.2f} -> R = {r_tot_re:.2f} R_E{proof_str}")
+            
             return True, m_core, track_name, result_dict
         else:
             return False, m_core, track_name, "Solver failed to converge."
             
     except Exception as e:
+        if os.path.exists(worker_temp_file):
+            try: os.remove(worker_temp_file)
+            except: pass
         return False, m_core, track_name, str(e)
 
 
@@ -218,36 +255,39 @@ if __name__ == '__main__':
     print(" Kepler-11e 1D Sweep: Multi-Track Metal Consumptions ")
     print("================================================================")
     
-    # Define all the evolutionary tracks you want to explore
     TRACKS = [
-        {"name": "Bulk Envelope Transfer", "type": "Bulk", "target_mz_me": 7.9},
-        {"name": "Direct Metal (Total Z = 7.5 M_E)", "type": "Direct", "target_mz_me": 7.5},
+        #{"name": "Bulk Envelope Transfer", "type": "Bulk", "target_mz_me": 7.9},
+        #{"name": "Direct Metal (Total Z = 7.5 M_E)", "type": "Direct", "target_mz_me": 7.5},
         {"name": "Direct Metal (Total Z = 7.0 M_E)", "type": "Direct", "target_mz_me": 7.0},
-        {"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
-        {"name": "Direct Metal (Total Z = 5.0 M_E)", "type": "Direct", "target_mz_me": 5.0},
+        #{"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
+        #{"name": "Direct Metal (Total Z = 5.0 M_E)", "type": "Direct", "target_mz_me": 5.0},
     ]
     
-    # Checkpoint Logic
     completed_tasks = set()
+    completed_sigmas = {} 
     os.makedirs(os.path.dirname(RESULTS_FILE), exist_ok=True)
     
     if os.path.exists(RESULTS_FILE):
         try:
             df_existing = pd.read_csv(RESULTS_FILE)
             for _, row in df_existing.iterrows():
-                completed_tasks.add((round(row['M_core_Me'], 3), row['Transfer_Mode']))
+                m_rnd = round(row['M_core_Me'], 3)
+                t_mode = row['Transfer_Mode']
+                completed_tasks.add((m_rnd, t_mode))
+                
+                if t_mode != 'Bulk Envelope Transfer':
+                    completed_sigmas[(t_mode, m_rnd)] = row['Sigma_Used']
+                    
             print(f"[*] Found {len(completed_tasks)} completed runs.")
         except Exception as e:
             print(f"[*] Could not read {RESULTS_FILE}: {e}")
             
-    # Dynamically generate grids anchored to each track's specific metal target
     tasks_to_run = []
     for track in TRACKS:
         t_name = track['name']
         t_type = track['type']
         t_mz = track['target_mz_me']
         
-        # Grid clustering: High density near the track's starting point (0 dilute mass)
         if t_type == 'Bulk':
             mass_grid = np.concatenate([
                 np.linspace(t_mz, t_mz - 0.4, 8),   
@@ -258,19 +298,24 @@ if __name__ == '__main__':
                 np.linspace(t_mz, t_mz - 0.5, 8),   
                 np.linspace(t_mz - 1.0, 1.0, 20)    
             ])
+            mass_grid = mass_grid [::-1]
             
         for m in mass_grid:
             if (round(m, 3), t_name) not in completed_tasks:
-                tasks_to_run.append((m, t_name, t_type, t_mz))
+                hint_sigma = None
+                if t_type == 'Direct' and completed_sigmas:
+                    track_keys = [k for k in completed_sigmas.keys() if k[0] == t_name]
+                    if track_keys:
+                        closest_key = min(track_keys, key=lambda k: abs(k[1] - m))
+                        hint_sigma = completed_sigmas[closest_key]
+
+                tasks_to_run.append((m, t_name, t_type, t_mz, hint_sigma))
             
     print(f"[*] Tasks remaining to compute: {len(tasks_to_run)}")
     
-    # Parallel Execution
     if tasks_to_run:
-        # Re-enabled multiprocessing to speed up the multiple tracks
-        n_workers = min(mp.cpu_count() - 1, 4)
+        n_workers = min(mp.cpu_count() - 1, 1)
         n_workers = max(1, n_workers) 
-        #n_workers = 3
         
         print(f"[*] Starting parallel execution with {n_workers} workers...")
         manager = mp.Manager()
@@ -286,7 +331,6 @@ if __name__ == '__main__':
                 success, m_core, mode, data = future.result()
                 
                 if success:
-                    print(f"  [+] {mode} | Core: {m_core:.2f} -> R = {data['R_total_Re']:.2f} R_E")
                     df_new = pd.DataFrame([data])
                     file_exists = os.path.exists(RESULTS_FILE)
                     df_new.to_csv(RESULTS_FILE, mode='a', header=not file_exists, index=False)
@@ -304,16 +348,15 @@ if __name__ == '__main__':
         
         plt.figure(figsize=(10, 7))
         
-        # Define aesthetic mapping for our distinct tracks
         colors = {
-            'Bulk Envelope Transfer': '#3498db',           # Blue
-            'Direct Metal (Total Z = 7.9 M_E)': '#e74c3c', # Red
-            'Direct Metal (Total Z = 7.0 M_E)': '#e67e22', # Orange
-            'Direct Metal (Total Z = 6.0 M_E)': '#9b59b6'  # Purple
+            'Bulk Envelope Transfer': '#3498db',           
+            'Direct Metal (Total Z = 7.5 M_E)': '#e74c3c', 
+            'Direct Metal (Total Z = 7.0 M_E)': '#e67e22', 
+            'Direct Metal (Total Z = 6.0 M_E)': '#9b59b6'  
         }
         markers = {
             'Bulk Envelope Transfer': 's', 
-            'Direct Metal (Total Z = 7.9 M_E)': 'o',
+            'Direct Metal (Total Z = 7.5 M_E)': 'o',
             'Direct Metal (Total Z = 7.0 M_E)': '^',
             'Direct Metal (Total Z = 6.0 M_E)': 'D'
         }

@@ -360,6 +360,7 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
     result = {
         "M_total": m, "R_total": r, 
         "M_core_actual": core_res['M_actual'], 
+        "M_water": params['M_water'],
         "R": np.concatenate([core_res['R'], water_R]),
         "M": np.concatenate([core_res['M'], water_M]),
         "P": np.concatenate([core_res['P'], water_P]),
