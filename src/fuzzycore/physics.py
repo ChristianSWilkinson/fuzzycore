@@ -62,7 +62,9 @@ def integrate_core(Pc_bar: float, M_core: float, T_center: float = 5000.0,
 
         g = (c.G_CONST * m) / (r**2)
         H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
-        dr = min(500.0, H_P * 0.1)
+        
+        # SPEEDUP: Step core by up to 10km at a time (up from 500m)
+        dr = min(10000.0, H_P * 0.1)
 
         dm_dr = 4 * np.pi * r**2 * rho
         dr = min(dr, (M_core - m) / dm_dr)
@@ -72,7 +74,8 @@ def integrate_core(Pc_bar: float, M_core: float, T_center: float = 5000.0,
         m += dm_dr * dr
         r += dr
 
-        if k % 50 == 0:
+        # Adjusted save cadence due to larger spatial steps
+        if k % 10 == 0:
             R_h.append(r); M_h.append(m); P_h.append(p_log_bar)
             Rho_h.append(rho); T_h.append(T_current) 
             S_h.append(0.0); Z_h.append(1.0)
@@ -159,7 +162,8 @@ def build_staircase_envelope(p_surf_bar: float, p_bottom_bar: float,
         prev_z_key = z_key
         prev_target_s = target_s
 
-        n_points = 500 
+        # SPEEDUP: 100 KD-Tree queries per layer is plenty for a 1D interpolator (Down from 500)
+        n_points = 100 
         p_layer_grid = np.linspace(lp_start, lp_end, n_points)
         curr_lt_guess = np.log10(max(50.0, current_T_val))
 
@@ -281,7 +285,9 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
 
         g = (c.G_CONST * m) / (r**2)
         H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
-        dr = min(5000.0, H_P * 0.05)
+        
+        # SPEEDUP: Much larger spatial steps through the mantle
+        dr = min(25000.0, H_P * 0.1)
 
         dm_dr = 4 * np.pi * r**2 * rho
         target_water_mass = params['M_water']
@@ -300,7 +306,7 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
         r += dr
         p_pa = p_new
         
-        if k % 100 == 0:
+        if k % 20 == 0:
             water_R.append(r); water_M.append(m); water_P.append(p_log)
             water_Rho.append(rho); water_T.append(temp)
             water_S.append(target_s); water_Z.append(1.0)
@@ -333,7 +339,9 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
 
             g = (c.G_CONST * m) / (r**2)
             H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
-            dr = min(5000.0, H_P * 0.05, abs((p_pa - p_surf_pa) / (rho * g)) * 0.5)
+            
+            # SPEEDUP: Larger envelope steps
+            dr = min(25000.0, H_P * 0.1, abs((p_pa - p_surf_pa) / (rho * g)) * 0.5)
             if dr < 1.0: dr = 1.0
 
             dm_dr = 4 * np.pi * r**2 * rho
@@ -347,7 +355,7 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
             r += dr
             p_pa = p_new
             
-            if k % 100 == 0:
+            if k % 20 == 0:
                 water_R.append(r); water_M.append(m); water_P.append(p_log)
                 water_Rho.append(rho); water_T.append(temp)
                 water_S.append(entr); water_Z.append(z_val)
@@ -465,7 +473,7 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
             g = (c.G_CONST * m) / (r**2)
             H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
             
-            # 🛑 THE FIX: MASSIVE step sizes for the Scout to fly through convergence!
+            # SPEEDUP: MASSIVE step sizes for the Scout to fly through convergence!
             dr = min(100000.0, H_P * 0.2)  
             
             dm_dr = 4 * np.pi * r**2 * rho
@@ -485,7 +493,7 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
         return error
 
     try:
-        # 🛑 THE FIX: Reduced to 7 scan points to save processing time
+        # SPEEDUP: Reduced to 15 scan points to save processing time
         scan_pts = np.linspace(np.log10(params['P_surf']), logP_rock_top - 1e-4, 15)
         vals = [mass_error(p) for p in scan_pts]
 
@@ -499,7 +507,7 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
         if not bracket:
             return None
 
-        # 🛑 THE FIX: Loosened xtol to 1e-1 so brentq stops immediately after finding a rough bracket!
+        # SPEEDUP: Loosened xtol to 1e-3 so brentq stops immediately after finding a rough bracket!
         root_logP = brentq(mass_error, bracket[0], bracket[1], xtol=1e-3)
         converged_P_int = 10 ** root_logP
         
@@ -539,7 +547,7 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
 
     try:
         env = build_staircase_envelope(
-            params['P_surf'], P_int_guess, params['T_surf'], params['z_profile'], eos_data['fluid']
+            params['P_surf'], P_int_guess, params['T_surf'], params['z_profile'], eos_data['fluid'], debug=debug
         )
     except Exception:
         return None
@@ -548,7 +556,7 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
         return None
 
     try:
-        # 🛑 THE FIX: Convert BOTH Temperature and Density back to linear for Gas Giants!
+        # THE FIX: Convert BOTH Temperature and Density back to linear for Gas Giants!
         T_match = 10 ** float(env['t'](np.log10(P_int_guess)))
         if np.isnan(T_match): T_match = 5000.0
         Rho_match = 10 ** float(env['rho'](np.log10(P_int_guess)))
@@ -591,7 +599,7 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
         p_lookup = np.clip(p_log, p_min_log, p_max_log)
         
         try:
-            # 🛑 THE FIX: Convert logarithmic outputs to physical linear units for Gas Giants!
+            # THE FIX: Convert logarithmic outputs to physical linear units for Gas Giants!
             rho = 10 ** float(env['rho'](p_lookup))
             temp = 10 ** float(env['t'](p_lookup))
             entr = float(env['s'](p_lookup))
@@ -603,7 +611,8 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
         dp_dr = -rho * g
         H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
         
-        dr = min(5000.0, H_P * 0.05, abs((p_pa - params['P_surf'] * 1e5) / dp_dr) * 0.5)
+        # SPEEDUP: Step the envelope up to 25km at a time
+        dr = min(25000.0, H_P * 0.1, abs((p_pa - params['P_surf'] * 1e5) / dp_dr) * 0.5)
         dr = max(dr, 1.0)
         
         p_new = p_pa + dp_dr * dr
@@ -615,7 +624,7 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
         r += dr
         p_pa = p_new
         
-        if k % 10 == 0:
+        if k % 20 == 0:
             R_h.append(r); M_h.append(m); P_h.append(p_log)
             Rho_h.append(rho); T_h.append(temp)
             S_h.append(entr); Z_h.append(z_val)

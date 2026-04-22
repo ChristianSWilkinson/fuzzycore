@@ -10,7 +10,6 @@ Water Worlds) and tracks intermediate solutions during the solving process.
 import os
 
 import numpy as np
-import pandas as pd
 from scipy.optimize import brentq
 
 from . import constants as c
@@ -19,7 +18,7 @@ from . import physics
 
 
 def solve_structure(target_val: float, params: dict, mode: str, 
-                    trial_id: str, csv_file: str, write_lock) -> dict:
+                    trial_id: str) -> dict:
     """
     Solves for the planetary structure by finding the central pressure 
     required to match a target total mass or surface gravity.
@@ -74,33 +73,25 @@ def solve_structure(target_val: float, params: dict, mode: str,
     # 1. Setup Equation of State (EOS) Data
     # =========================================================================
     
-    # Initialize the base interpolators
-    rock = eos.get_rock_interpolator()  # Now guaranteed to exist
-
-    # Extract the dynamic H/He ratio from params (defaults to Solar 0.26)
+    rock = eos.get_rock_interpolator()  
     y_ratio = params.get('Y_ratio', 0.26)
     
-    # Default to a 10-step gradient if z_profile is missing
     default_z_profile = np.linspace(0.01, 1.0, 10)
     fluid = eos.generate_fluid_interpolators(params.get('z_profile', default_z_profile))
     
     eos_data = {'rock': rock, 'fluid': fluid}
     
-    # Detect Mode: Does this planet have a distinct water mantle?
     is_water_world = 'M_water' in params and params['M_water'] > 0
     
     # =========================================================================
     # 2. Parameter Aliasing & Fallbacks
     # =========================================================================
     
-    # If the user provides M_rock but no M_water, seamlessly map it to M_core 
-    # to prevent KeyErrors in the simple gas giant integrator.
     if 'M_core' not in params and 'M_rock' in params:
         params['M_core'] = params['M_rock']
     elif 'M_rock' not in params and 'M_core' in params:
-        params['M_rock'] = params['M_core']  # Fallback for intermediate outputs
+        params['M_rock'] = params['M_core']  
 
-    # If it is a water world, load the specific ab-initio water tables
     if is_water_world:
         water = eos.get_water_interpolators_complete()
         eos_data['water'] = water
@@ -108,10 +99,9 @@ def solve_structure(target_val: float, params: dict, mode: str,
     params['target_m'] = target_val
     
     # =========================================================================
-    # 3. Objective Function for Root Finding (WITH MEMORY CACHE)
+    # 3. Objective Function for Root Finding (WITH MEMORY CACHE, NO DISK I/O)
     # =========================================================================
     
-    # 🛑 THE EFFICIENCY FIX: Cache evaluations so we never integrate the same guess twice!
     eval_cache = {}
 
     def objective(log_pc: float) -> float:
@@ -119,7 +109,6 @@ def solve_structure(target_val: float, params: dict, mode: str,
         Integrates the planet for a guessed central pressure (log_pc) 
         and returns the error relative to the target mass/gravity.
         """
-        # Truncate slightly to prevent floating point cache misses
         log_pc_rounded = round(float(log_pc), 12)
         if log_pc_rounded in eval_cache:
             return eval_cache[log_pc_rounded]
@@ -138,8 +127,6 @@ def solve_structure(target_val: float, params: dict, mode: str,
             
             # --- FAIL CRITERIA ---
             if res is None or np.isnan(res['M'][-1]):
-                # 🛑 THE FIX: Add a tiny artificial slope based on log_pc 
-                # This prevents brentq from dividing by zero on a flat plateau
                 slope_assist = log_pc * 0.0001  
                 
                 if mode == 'mass':
@@ -152,7 +139,6 @@ def solve_structure(target_val: float, params: dict, mode: str,
                     print(f"      ❌ FAILURE: Integration returned None (Unbound) | Fallback Error: {error/c.M_EARTH:+.3f} Me")
                     
             elif res['M'][-1] < (interior_mass * 0.99):
-                # Same fallback if the integration stopped prematurely
                 if mode == 'mass':
                     error = interior_mass - target_val
                 else:
@@ -166,36 +152,12 @@ def solve_structure(target_val: float, params: dict, mode: str,
                 actual_m = res['M'][-1]
                 actual_r = res['R'][-1]
                 
-                # Save intermediate solver steps for tracking
-                intermediate_output = {
-                    'trial_id': f"{trial_id}_step",
-                    'target_mode': mode,
-                    'target_value': target_val,
-                    'P_surf_bar': params['P_surf'],
-                    'T_surf_K': params['T_surf'],
-                    'M_total_Mj': actual_m / c.M_JUPITER,
-                    'R_total_Rj': actual_r / c.R_JUPITER,
-                    'M_Z_total_Me': res.get('M_Z_total', params.get('M_rock', 0)) / c.M_EARTH,
-                    'P_center_bar': 10 ** log_pc,
-                    'Iron_Fraction': params.get('iron_fraction', 0.0),
-                    'status': 'success_intermediate' 
-                }
-                
-                with write_lock:
-                    df_out = pd.DataFrame([intermediate_output])
-                    file_exists = os.path.exists(csv_file)
-                    df_out.to_csv(csv_file, mode='a', header=not file_exists, index=False)
-                
-                # Calculate final error and set current_val for logging
+                # Calculate final error (NO CSV WRITING HAPPENS HERE ANYMORE = MASSIVE SPEEDUP)
                 if mode == 'gravity':
                     g_surf = (c.G_CONST * actual_m) / (actual_r ** 2)
                     error = g_surf - target_val
-                    current_val = g_surf
-                    unit = "m/s^2"
                 elif mode == 'mass':
                     error = actual_m - target_val
-                    current_val = actual_m
-                    unit = "kg"
                 
                 if params.get('debug'):
                     print(f"      ✅ SUCCESS: Mass Achieved: {actual_m/c.M_EARTH:.3f} Me | Error: {error/c.M_EARTH:+.3f} Me")
@@ -213,7 +175,6 @@ def solve_structure(target_val: float, params: dict, mode: str,
     # 4. Dynamic Bounds & Concentric Bracketing Search
     # =========================================================================
     
-    # Vastly relaxed bounds. Thin envelopes require wildly varied central pressures.
     m_core_earth = params.get('M_rock', params.get('M_core', 5.0)) / c.M_EARTH
     
     if m_core_earth < 2.0: min_pc, max_pc = 4.5, 9.0
@@ -224,47 +185,12 @@ def solve_structure(target_val: float, params: dict, mode: str,
     guess = params.get('initial_log_pc', None)
     bracket = None
 
-    # --- A. Mine the Smart Prior ---
-    if os.path.exists(csv_file):
-        try:
-            with write_lock:
-                df_history = pd.read_csv(csv_file)
-            
-            df_history = df_history[df_history['status'] == 'success_intermediate']
-            if not df_history.empty:
-                if mode == 'mass':
-                    achieved_mass_kg = df_history['M_total_Mj'] * c.M_JUPITER
-                    best_idx = np.argmin(np.abs(achieved_mass_kg - target_val))
-                elif mode == 'gravity':
-                    achieved_mass_kg = df_history['M_total_Mj'] * c.M_JUPITER
-                    achieved_radius_m = df_history['R_total_Rj'] * c.R_JUPITER
-                    achieved_g = (c.G_CONST * achieved_mass_kg) / (achieved_radius_m**2)
-                    best_idx = np.argmin(np.abs(achieved_g - target_val))
-                    
-                best_pc = df_history.iloc[best_idx]['P_center_bar']
-                guess = np.log10(best_pc)
-                if params.get('debug'):
-                    print(f"  [Smart Prior] Mined historical model. Prior guess set to logPc={guess:.3f}")
-        except Exception:
-            pass
-
-    # --- B. The Concentric Search Algorithm ---
-    # We map the "Valley of Death" by testing tight offsets first (±0.05), 
-    # ensuring we never accidentally step over the target mass!
+    # We map the "Valley of Death" by testing tight offsets first
     center = guess if guess is not None else (min_pc + max_pc) / 2.0
     center = max(min_pc, min(max_pc, center))
 
-    offsets = [
-        0.0, 
-        -0.05, 0.05, 
-        -0.15, 0.15, 
-        -0.3, 0.3, 
-        -0.6, 0.6, 
-        -1.0, 1.0, 
-        -1.5, 1.5, 
-        -2.0, 2.0,
-        -3.0, 3.0
-    ]
+    # SPEEDUP: Streamlined concentric search offsets
+    offsets = [0.0, -0.1, 0.1, -0.3, 0.3, -0.8, 0.8, -1.5, 1.5, -2.5, 2.5]
     
     valid_evals = []
 
@@ -296,7 +222,9 @@ def solve_structure(target_val: float, params: dict, mode: str,
     if not bracket:
         if params.get('debug'):
             print("  [Solver] Concentric search failed. Launching ultra-wide global fallback grid...")
-        global_pts = np.linspace(min_pc, max_pc, 25)
+        
+        # SPEEDUP: Reduced from 25 points to 15 points
+        global_pts = np.linspace(min_pc, max_pc, 15)
         for p_test in global_pts:
             err = objective(p_test)
             if abs(err) < 1e29:
