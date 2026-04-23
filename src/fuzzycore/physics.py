@@ -64,7 +64,7 @@ def integrate_core(Pc_bar: float, M_core: float, T_center: float = 5000.0,
         H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
         
         # SPEEDUP: Step core by up to 10km at a time (up from 500m)
-        dr = min(10000.0, H_P * 0.1)
+        dr = min(1000.0, H_P * 0.05)
 
         dm_dr = 4 * np.pi * r**2 * rho
         dr = min(dr, (M_core - m) / dm_dr)
@@ -287,7 +287,7 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
         H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
         
         # SPEEDUP: Much larger spatial steps through the mantle
-        dr = min(25000.0, H_P * 0.1)
+        dr = min(1000.0, H_P * 0.05)
 
         dm_dr = 4 * np.pi * r**2 * rho
         target_water_mass = params['M_water']
@@ -341,7 +341,7 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
             H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
             
             # SPEEDUP: Larger envelope steps
-            dr = min(25000.0, H_P * 0.1, abs((p_pa - p_surf_pa) / (rho * g)) * 0.5)
+            dr = min(1000.0, H_P * 0.02, abs((p_pa - p_surf_pa) / (rho * g)) * 0.5)
             if dr < 1.0: dr = 1.0
 
             dm_dr = 4 * np.pi * r**2 * rho
@@ -474,7 +474,7 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
             H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
             
             # SPEEDUP: MASSIVE step sizes for the Scout to fly through convergence!
-            dr = min(100000.0, H_P * 0.2)  
+            dr = min(1000.0, H_P * 0.1)  
             
             dm_dr = 4 * np.pi * r**2 * rho
             p_new = p_pa - rho * g * dr
@@ -612,7 +612,7 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
         H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
         
         # SPEEDUP: Step the envelope up to 25km at a time
-        dr = min(25000.0, H_P * 0.1, abs((p_pa - params['P_surf'] * 1e5) / dp_dr) * 0.5)
+        dr = min(1000.0, H_P * 0.02, abs((p_pa - params['P_surf'] * 1e5) / dp_dr) * 0.5)
         dr = max(dr, 1.0)
         
         p_new = p_pa + dp_dr * dr
