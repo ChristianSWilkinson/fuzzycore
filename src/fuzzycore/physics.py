@@ -15,6 +15,33 @@ def get_stepper(stack_entry: dict):
         stack_entry['stepper'] = eos.RobustAdiabatStepper(stack_entry)
     return stack_entry['stepper']
 
+def calculate_adaptive_dr(r: float, m: float, p_pa: float, rho: float, g: float, 
+                          target_mass: float, is_core: bool = False) -> float:
+    """
+    Dynamically calculates the spatial step size (dr) by evaluating the local 
+    scale heights of Pressure, Mass, and Radius. Ensures high accuracy without 
+    hardcoded distance ceilings.
+    """
+    if g <= 0 or rho <= 0: return 1000.0
+
+    # 1. Pressure Constraint: Do not step more than X% of the Pressure Scale Height
+    eps_p = 0.05 if is_core else 0.02
+    dp_dr = rho * g
+    dr_p = (p_pa / dp_dr) * eps_p
+    
+    # 2. Mass Constraint: Do not consume more than 2% of the REMAINING mass in one step
+    dm_dr = 4 * np.pi * r**2 * rho
+    mass_left = abs(target_mass - m)
+    dr_m = (mass_left / dm_dr) * 0.02 if dm_dr > 0 else 1e9
+    
+    # 3. Radial Constraint: Do not step more than 10% of the current radius 
+    # (Crucial for stability near the very center of the planet)
+    dr_r = r * 0.1 if r > 0 else 1e9
+    
+    # Take the most conservative physics limit, with an absolute safety floor/ceiling
+    dr = min(dr_p, dr_m, dr_r, 50000.0)
+    return max(dr, 1.0)
+
 # =============================================================================
 # 1. CORE INTEGRATOR
 # =============================================================================
@@ -64,7 +91,7 @@ def integrate_core(Pc_bar: float, M_core: float, T_center: float = 5000.0,
         H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
         
         # SPEEDUP: Step core by up to 10km at a time (up from 500m)
-        dr = min(1000.0, H_P * 0.05)
+        dr = calculate_adaptive_dr(r, m, p_pa, rho, g, M_core, is_core=True)
 
         dm_dr = 4 * np.pi * r**2 * rho
         dr = min(dr, (M_core - m) / dm_dr)
@@ -286,14 +313,11 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
         g = (c.G_CONST * m) / (r**2)
         H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
         
-        # SPEEDUP: Much larger spatial steps through the mantle
-        dr = min(1000.0, H_P * 0.05)
-
         dm_dr = 4 * np.pi * r**2 * rho
         target_water_mass = params['M_water']
         current_water_mass = m - core_res['M_actual']
         
-        dr = min(dr, (target_water_mass - current_water_mass) / dm_dr)
+        dr = calculate_adaptive_dr(r, m, p_pa, rho, g, core_res['M_actual'] + target_water_mass)
         if dr < 1.0: dr = 1.0
 
         p_new = p_pa - rho * g * dr
@@ -340,8 +364,11 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
             g = (c.G_CONST * m) / (r**2)
             H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
             
-            # SPEEDUP: Larger envelope steps
-            dr = min(1000.0, H_P * 0.02, abs((p_pa - p_surf_pa) / (rho * g)) * 0.5)
+            # --- ADAPTIVE STEP ---
+            dr = calculate_adaptive_dr(r, m, p_pa, rho, g, target_mass=1e30)
+            
+            # Ensure we don't overshoot the surface boundary
+            dr = min(dr, abs((p_pa - p_surf_pa) / (rho * g)))
             if dr < 1.0: dr = 1.0
 
             dm_dr = 4 * np.pi * r**2 * rho
@@ -474,7 +501,7 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
             H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
             
             # SPEEDUP: MASSIVE step sizes for the Scout to fly through convergence!
-            dr = min(1000.0, H_P * 0.1)  
+            dr = calculate_adaptive_dr(r, m, p_pa, rho, g, target_mass=1e30, is_core=True) 
             
             dm_dr = 4 * np.pi * r**2 * rho
             p_new = p_pa - rho * g * dr
@@ -612,7 +639,8 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
         H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
         
         # SPEEDUP: Step the envelope up to 25km at a time
-        dr = min(1000.0, H_P * 0.02, abs((p_pa - params['P_surf'] * 1e5) / dp_dr) * 0.5)
+        dr = calculate_adaptive_dr(r, m, p_pa, rho, g, target_mass=1e30)
+        dr = min(dr, abs((p_pa - params['P_surf'] * 1e5) / dp_dr))
         dr = max(dr, 1.0)
         
         p_new = p_pa + dp_dr * dr
