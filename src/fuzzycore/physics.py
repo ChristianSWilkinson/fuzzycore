@@ -555,6 +555,7 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
     pilot_core = integrate_core(Pc_bar, params['M_core'], T_center=5000.0, iron_fraction=iron_frac)
     
     if not pilot_core['valid']:
+        logging.warning(f"      ⚠️ [Physics] logPc={logPc:.2f} failed: P_center too weak to support a {params['M_core']/c.M_EARTH:.1f} M_E core.")
         return None
 
     P_int_guess = pilot_core['P_top']
@@ -576,14 +577,15 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
         env = build_staircase_envelope(
             params['P_surf'], P_int_guess, params['T_surf'], params['z_profile'], eos_data['fluid'], debug=debug
         )
-    except Exception:
+    except Exception as e:
+        logging.warning(f"      ⚠️ [Physics] logPc={logPc:.2f} failed: Envelope EOS crashed -> {e}")
         return None
         
     if env is None:
+        logging.warning(f"      ⚠️ [Physics] logPc={logPc:.2f} failed: Envelope builder returned None.")
         return None
 
     try:
-        # THE FIX: Convert BOTH Temperature and Density back to linear for Gas Giants!
         T_match = 10 ** float(env['t'](np.log10(P_int_guess)))
         if np.isnan(T_match): T_match = 5000.0
         Rho_match = 10 ** float(env['rho'](np.log10(P_int_guess)))
@@ -607,6 +609,7 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
     R_int_final = final_core['R_core']
     
     if P_int_final <= params['P_surf']:
+        logging.warning(f"      ⚠️ [Physics] logPc={logPc:.2f} failed: Core breached the {params['P_surf']} bar surface.")
         return None
 
     r = R_int_final
@@ -622,11 +625,16 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
     k = 0
 
     while (p_pa / 1e5) > params['P_surf']:
+        
+        # --- NEW: BOIL-OFF DETECTION ---
+        if r > 100 * c.R_JUPITER:
+            logging.warning(f"      ⚠️ [Physics] logPc={logPc:.2f} failed: Planet became unbound (R > 100 R_Jup). Thermal boil-off detected!")
+            break
+            
         p_log = np.log10(max(1e-10, p_pa / 1e5))
         p_lookup = np.clip(p_log, p_min_log, p_max_log)
         
         try:
-            # THE FIX: Convert logarithmic outputs to physical linear units for Gas Giants!
             rho = 10 ** float(env['rho'](p_lookup))
             temp = 10 ** float(env['t'](p_lookup))
             entr = float(env['s'](p_lookup))
@@ -636,9 +644,7 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
 
         g = (c.G_CONST * m) / r**2
         dp_dr = -rho * g
-        H_P = p_pa / (rho * g) if (rho * g) > 0 else 1e5
         
-        # SPEEDUP: Step the envelope up to 25km at a time
         dr = calculate_adaptive_dr(r, m, p_pa, rho, g, target_mass=1e30)
         dr = min(dr, abs((p_pa - params['P_surf'] * 1e5) / dp_dr))
         dr = max(dr, 1.0)

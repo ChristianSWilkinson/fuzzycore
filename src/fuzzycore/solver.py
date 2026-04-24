@@ -34,9 +34,6 @@ def solve_structure(target_val: float, params: dict, mode: str,
             structural mass parameters.
         mode (str): The convergence target mode ('mass' or 'gravity').
         trial_id (str): A unique identifier string for logging this specific run.
-        csv_file (str): Path to the temporary CSV file for tracking solver steps.
-        write_lock (threading.Lock): A lock object to prevent race conditions 
-            when writing intermediate results to the CSV in parallel.
 
     Returns:
         dict: The final converged planetary profile dictionary. Returns `None` 
@@ -125,28 +122,21 @@ def solve_structure(target_val: float, params: dict, mode: str,
                 res = physics.integrate_planet(log_pc, params, eos_data)
                 interior_mass = params['M_core']
             
-            # --- FAIL CRITERIA ---
+            # --- THE FIX: SMART FALLBACK ERROR ---
             if res is None or np.isnan(res['M'][-1]):
-                slope_assist = log_pc * 0.0001  
-                
-                if mode == 'mass':
-                    error = (interior_mass - target_val) + slope_assist
-                else:
-                    approx_r = (interior_mass / ( (4/3)*np.pi * 5000 ))**(1/3)
-                    error = (c.G_CONST * interior_mass / approx_r**2) - target_val + slope_assist
+                # If physics integration fails completely (usually because pressure is too weak),
+                # we force a strongly negative synthetic error to push brentq to hunt higher pressures.
+                error = -1e20 + (log_pc * 1e18) 
                 
                 if params.get('debug'):
-                    print(f"      ❌ FAILURE: Integration returned None (Unbound) | Fallback Error: {error/c.M_EARTH:+.3f} Me")
+                    print(f"      ❌ FAILURE: Integration returned None (Unbound) | Synthetic Error: {error:.2e}")
                     
             elif res['M'][-1] < (interior_mass * 0.99):
-                if mode == 'mass':
-                    error = interior_mass - target_val
-                else:
-                    approx_r = (interior_mass / ( (4/3)*np.pi * 5000 ))**(1/3)
-                    error = (c.G_CONST * interior_mass / approx_r**2) - target_val
+                # If it stalled prematurely, also push higher
+                error = -1e19 + (log_pc * 1e17)
 
                 if params.get('debug'):
-                    print(f"      ❌ FAILURE: Integration Prematurely Stalled | Fallback Error: {error/c.M_EARTH:+.3f} Me")
+                    print(f"      ❌ FAILURE: Integration Prematurely Stalled | Synthetic Error: {error:.2e}")
                     
             else:
                 actual_m = res['M'][-1]
@@ -168,8 +158,8 @@ def solve_structure(target_val: float, params: dict, mode: str,
         except Exception as e:
             if params.get('debug'):
                 print(f"      💥 CRASH in Objective: {str(e)}")
-            eval_cache[log_pc_rounded] = 1e30
-            return 1e30
+            eval_cache[log_pc_rounded] = -1e20
+            return -1e20
 
     # =========================================================================
     # 4. Dynamic Bounds & Concentric Bracketing Search
@@ -239,6 +229,11 @@ def solve_structure(target_val: float, params: dict, mode: str,
                     print(f"  [Solver] ✅ Root globally bracketed between {bracket[0]:.3f} and {bracket[1]:.3f}!")
                 break
 
+    if not bracket:
+        print(f"  ❌ [Solver] FATAL: Could not bracket the root! Planet is physically impossible.")
+        print(f"  ❌ Evaluated [logPc, Error] pairs: {[(round(p, 2), f'{err:.2e}') for p, err in valid_evals]}")
+        return None
+
     # =========================================================================
     # 5. Final Convergence (Brent's Method)
     # =========================================================================
@@ -250,10 +245,6 @@ def solve_structure(target_val: float, params: dict, mode: str,
             if is_water_world:
                 return physics.integrate_water_world(root, params, eos_data)
             return physics.integrate_planet(root, params, eos_data)
-        else:
-            if params.get('debug'):
-                print("  [Solver] FATAL: Could not bracket the root. Planet may be physically impossible.")
-            return None
             
     except Exception as e:
         if params.get('debug'):
