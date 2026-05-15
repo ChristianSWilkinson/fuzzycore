@@ -7,9 +7,164 @@ and handling execution locks during parallelized parameter sweeps.
 """
 
 import numpy as np
+import time
+import logging
+from functools import wraps
 
 from . import constants as c
 
+def time_it(func):
+    """A decorator that prints the execution time of the function."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        end = time.perf_counter()
+        
+        # Calculate time
+        elapsed_ms = (end - start) * 1000
+        if elapsed_ms > 1.0: # Only log things that take more than 1 millisecond
+            #print(f"⏱️ [TIMER] {func.__name__} executed in {elapsed_ms:.2f} ms")
+            pass
+            
+        return result
+    return wrapper
+
+def generate_linear_z_profile(
+    n_layers: int = 25,
+    z_base: float = 0.02,
+    z_core: float = 0.98,
+    **_kwargs,
+) -> np.ndarray:
+    """
+    Linear Z gradient from atmosphere (index 0) to core boundary (index -1).
+
+    Same index convention as `generate_gaussian_z_profile`. Monotonic.
+
+    Args:
+        n_layers: Number of discrete layers. <=1 returns a single-element
+            array `[z_base]` (well-mixed adiabatic envelope).
+        z_base: Z at the atmospheric surface.
+        z_core: Z at the inner core-envelope interface.
+        **_kwargs: Ignored; accepted for `generate_z_profile` compatibility.
+    """
+    if n_layers is None or n_layers <= 1:
+        return np.array([z_base])
+    return np.clip(np.linspace(z_base, z_core, n_layers), 0.0, 0.99)
+
+
+def generate_inverted_z_profile(
+    n_layers: int = 100,
+    z_base: float = 0.02,
+    z_core: float = 0.98,
+    z_atm: float = 0.08,
+    atm_depth: float = 0.15,
+    transition_width: float = 0.03,
+    sigma: float = 0.15,
+    **_kwargs,
+) -> np.ndarray:
+    """
+    Non-monotonic Z profile: enriched outer atmosphere -> depleted shell ->
+    rising to a dilute core in the deep interior.
+
+    Models a Jupiter-style Z inversion (e.g. molecular envelope enriched in
+    heavies above a depleted radiative/He-rain layer, then dilute core):
+
+        index 0  (surface)        Z ≈ z_atm   (enriched)
+        index ~atm_depth*n        Z ≈ z_base  (depleted shell)
+        index -1 (core boundary)  Z ≈ z_core  (dilute core)
+
+    Requires the spatial-order layer builder in `build_staircase_envelope`
+    (see physics.py patch) — the old sorted-unique logic does not handle
+    non-monotonic profiles correctly.
+
+    Args:
+        n_layers: Number of discrete layers.
+        z_base: Depleted-shell baseline.
+        z_core: Peak Z at the core boundary.
+        z_atm: Enriched Z at the very top of the atmosphere. Set equal to
+            z_base to recover the pure Gaussian shape.
+        atm_depth: Fraction (0–1) of the envelope occupied by the enriched
+            atmosphere.
+        transition_width: Tanh transition width between z_atm and z_base, in
+            normalised depth units. Smaller = sharper step.
+        sigma: Width of the inner Gaussian rise toward z_core (same meaning
+            as in `generate_gaussian_z_profile`).
+    """
+    if n_layers is None or n_layers <= 1:
+        return np.array([z_atm])
+
+    x = np.linspace(0.0, 1.0, n_layers)  # 0 = surface, 1 = core
+
+    # Inner Gaussian rise (same sub-grid amplitude correction as the
+    # canonical Gaussian generator, so narrow-sigma cases stay mass-conserved)
+    gaussian_area = sigma * np.sqrt(np.pi / 2.0)
+    dx = 1.0 / max(1, n_layers - 1)
+    amplitude_scaler = min(1.0, gaussian_area / dx)
+    dynamic_z_core = z_base + (z_core - z_base) * amplitude_scaler
+    inner = z_base + (dynamic_z_core - z_base) * np.exp(
+        -((x - 1.0) ** 2) / (2.0 * sigma ** 2)
+    )
+
+    # Outer enriched atmosphere: smooth tanh step from z_atm down to z_base
+    tw = max(transition_width, 1e-6)
+    atm_weight = 0.5 * (1.0 - np.tanh((x - atm_depth) / tw))
+
+    return np.clip(inner + (z_atm - z_base) * atm_weight, 0.0, 0.99)
+
+
+def generate_z_profile(
+    profile_type: str = "gaussian",
+    n_layers: int = 25,
+    **kwargs,
+) -> np.ndarray:
+    """
+    Unified factory for Z profiles. Use this as the single entry point
+    going forward — the older `generate_gaussian_z_profile` is kept as a
+    backward-compatible alias.
+
+    Profile types:
+        'gaussian'  Classic falloff from core. Uses sigma, z_base, z_core.
+        'linear'    Linear gradient. Uses z_base, z_core.
+        'inverted'  Enriched atmosphere over depleted shell, rising to
+                    dilute core. Uses z_atm, atm_depth, transition_width,
+                    sigma, z_base, z_core. Non-monotonic.
+        'custom'    User-supplied array via the `profile=...` kwarg.
+                    Pass anything — posterior samples, MCMC chains, hand-
+                    drawn shapes. Clipped to [0, 0.99] but otherwise used
+                    as-is. Length >= 1, ordered surface -> core.
+
+    Args:
+        profile_type: One of the above.
+        n_layers: Number of layers (ignored for 'custom').
+        **kwargs: Profile-specific parameters; unused ones are silently
+            ignored so retrieval samplers can pass a flat parameter dict.
+
+    Returns:
+        1D np.ndarray of Z values, ordered surface (idx 0) -> core (idx -1).
+    """
+    if profile_type == "custom":
+        if "profile" not in kwargs:
+            raise ValueError(
+                "profile_type='custom' requires a 'profile' kwarg "
+                "(1D array, surface -> core)."
+            )
+        profile = np.asarray(kwargs["profile"], dtype=float).ravel()
+        if profile.size < 1:
+            raise ValueError("Custom 'profile' must be non-empty.")
+        return np.clip(profile, 0.0, 0.99)
+
+    dispatch = {
+        "gaussian": generate_gaussian_z_profile,
+        "linear":   generate_linear_z_profile,
+        "inverted": generate_inverted_z_profile,
+    }
+    if profile_type not in dispatch:
+        raise ValueError(
+            f"Unknown profile_type='{profile_type}'. "
+            f"Choose from {list(dispatch.keys()) + ['custom']}."
+        )
+    return dispatch[profile_type](n_layers=n_layers, **kwargs)
 
 def generate_gaussian_z_profile(
     n_layers: int = 25,
@@ -310,4 +465,32 @@ def verify_ddc_macroscopic_gradient(
         'Nu_T': Nu_T,
         'F_tot': F_tot,
         'match_ratio': match_ratio
+    }
+
+def calculate_thermal_contrast(results: dict) -> dict:
+    """
+    Evaluates the static thermal blanketing effect of the envelope.
+    Calculates the temperature and entropy contrast across the fluid domain.
+    """
+    temp_array = results['T']
+    s_array = results['S']
+    
+    # Surface conditions (last element of the arrays)
+    t_surf = temp_array[-1]
+    s_surf = s_array[-1]
+    
+    # Deep conditions (base of the envelope / top of the rock core)
+    env_mask = s_array > 0.0
+    
+    # The first element [0] of the masked envelope is the deepest part (CMB)
+    t_deep = temp_array[env_mask][0] if np.any(env_mask) else t_surf
+    s_deep = s_array[env_mask][0] if np.any(env_mask) else s_surf
+
+    return {
+        'T_top': t_surf,
+        'T_deep': t_deep,
+        'S_top' : s_surf,
+        'S_deep' : s_deep,
+        'Delta_T': t_deep - t_surf,
+        'Delta_S': s_deep - s_surf
     }

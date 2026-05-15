@@ -1,10 +1,12 @@
 import numpy as np
+import logging
 from scipy.interpolate import interp1d
 from scipy.optimize import brentq
 
 from . import constants as c
 from . import eos
-from . import utils  
+from . import utils
+from .utils import time_it
 
 # =============================================================================
 # 0. HELPER FUNCTIONS
@@ -18,35 +20,42 @@ def get_stepper(stack_entry: dict):
 def calculate_adaptive_dr(r: float, m: float, p_pa: float, rho: float, g: float, 
                           target_mass: float, is_core: bool = False) -> float:
     """
-    Dynamically calculates the spatial step size (dr) by evaluating the local 
-    scale heights of Pressure, Mass, and Radius. Ensures high accuracy without 
-    hardcoded distance ceilings.
+    Dynamically calculates the spatial step size (dr).
+    Upgraded for extreme resolution in low-mass/thin-envelope regimes.
     """
-    if g <= 0 or rho <= 0: return 1000.0
+    if g <= 0 or rho <= 0: 
+        return 1000.0
 
-    # 1. Pressure Constraint: Do not step more than X% of the Pressure Scale Height
-    eps_p = 0.05 if is_core else 0.02
+    # 1. Pressure Constraint (The most critical for envelopes)
+    # Require 2% resolution in the solid core, but ultra-tight 0.5% in the gas envelope
+    eps_p = 0.02 if is_core else 0.005 
     dp_dr = rho * g
     dr_p = (p_pa / dp_dr) * eps_p
     
-    # 2. Mass Constraint: Do not consume more than 2% of the REMAINING mass in one step
+    # 2. Mass Constraint
+    # Do not consume more than 1% of the remaining target mass in a single step
     dm_dr = 4 * np.pi * r**2 * rho
     mass_left = abs(target_mass - m)
-    dr_m = (mass_left / dm_dr) * 0.02 if dm_dr > 0 else 1e9
+    dr_m = (mass_left / dm_dr) * 0.01 if dm_dr > 0 else dr_p
     
-    # 3. Radial Constraint: Do not step more than 10% of the current radius 
-    # (Crucial for stability near the very center of the planet)
-    dr_r = r * 0.1 if r > 0 else 1e9
+    # 3. Radius Constraint (The Anti-Overshoot)
+    # Never step more than 0.5% of the current radius
+    dr_r = r * 0.005 
     
-    # Take the most conservative physics limit, with an absolute safety floor/ceiling
-    dr = min(dr_p, dr_m, dr_r, 50000.0)
-    return max(dr, 1.0)
+    # 4. Strict Physical Clamps
+    dr_min = 100.0     # 100 meters (Prevent infinite loops/Zeno's paradox)
+    dr_max = 25000.0   # 25 km max step (Keep it tight even in deep uniform regions)
+    
+    # Take the smallest, most conservative step required by the 3 physics constraints
+    best_dr = min(dr_p, dr_m, dr_r)
+    
+    return float(np.clip(best_dr, dr_min, dr_max))
 
 # =============================================================================
 # 1. CORE INTEGRATOR
 # =============================================================================
 
-def integrate_core(Pc_bar: float, M_core: float, T_center: float = 5000.0, 
+def integrate_core(Pc_bar: float, M_core: float, T_center: float = 500.0, 
                    iron_fraction: float = 0.33, env_rho_base: float = 0.0,
                    nabla_ad: float = 0.0) -> dict:
     
@@ -63,12 +72,22 @@ def integrate_core(Pc_bar: float, M_core: float, T_center: float = 5000.0,
     
     lt_safe_c = np.log10(np.clip(T_center, 300.0, 49000.0))
     rho_log = eos.query_core_eos(p_log_bar, lt_safe_c, iron_fraction)
+    if not np.isfinite(rho_log) or rho_log > 5.5:   # 10^5.5 ≈ 300 000 kg/m³, above any physical rock
+        # EOS returned garbage — this (P, T) point is outside the valid table range
+        return {
+            'P_top': 0.0, 'R_core': 0.0, 'Rho_top': 0.0, 'M_actual': 0.0, 'valid': False,
+            'R': np.array([r]), 'M': np.array([0.0]),
+            'P': np.array([p_log_bar]), 'Rho': np.array([0.0]),
+            'T': np.array([T_center]), 'S': np.array([0.0]), 'Z': np.array([1.0])
+        }
     rho_c = 10 ** rho_log
 
     m = (4 / 3) * np.pi * rho_c * r**3
     rho = rho_c
 
     R_h, M_h, P_h, Rho_h, T_h, S_h, Z_h = [], [], [], [], [], [], []
+
+    T_current = T_center
     k = 0
 
     while m < M_core:
@@ -80,6 +99,8 @@ def integrate_core(Pc_bar: float, M_core: float, T_center: float = 5000.0,
         lt_safe = np.log10(np.clip(T_current, 300.0, 49000.0))
         
         rho_log = eos.query_core_eos(p_log_bar, lt_safe, iron_fraction)
+        if not np.isfinite(rho_log) or rho_log > 5.5:
+            break   # treat as reaching the edge of the EOS table — stop the core integration here
         raw_rho = 10 ** rho_log
         
         if raw_rho < env_rho_base:
@@ -102,7 +123,7 @@ def integrate_core(Pc_bar: float, M_core: float, T_center: float = 5000.0,
         r += dr
 
         # Adjusted save cadence due to larger spatial steps
-        if k % 10 == 0:
+        if k % 2 == 0:
             R_h.append(r); M_h.append(m); P_h.append(p_log_bar)
             Rho_h.append(rho); T_h.append(T_current) 
             S_h.append(0.0); Z_h.append(1.0)
@@ -147,18 +168,41 @@ def build_staircase_envelope(p_surf_bar: float, p_bottom_bar: float,
     if current_T_val > 5000.0:
         current_T_val = 200.0
         
-    env_boundaries = np.linspace(curr_lp_bar, final_lp_bar, len(used_z_steps) + 1)
+    z_rounded_arr = np.round(z_profile, 4)
+    n_prof = len(z_rounded_arr)
+
+    if n_prof == 1:
+        spatial_layers = [(float(z_rounded_arr[0]), 0.0, 1.0)]
+    else:
+        spatial_layers = []
+        block_start = 0
+        for i in range(1, n_prof):
+            if z_rounded_arr[i] != z_rounded_arr[i - 1]:
+                end_frac = (i - 0.5) / (n_prof - 1)
+                start_frac = spatial_layers[-1][2] if spatial_layers else 0.0
+                spatial_layers.append(
+                    (float(z_rounded_arr[block_start]), start_frac, end_frac)
+                )
+                block_start = i
+        start_frac = spatial_layers[-1][2] if spatial_layers else 0.0
+        spatial_layers.append(
+            (float(z_rounded_arr[block_start]), start_frac, 1.0)
+        )
+
+    current_T_val = float(T_surf)
+    if current_T_val > 5000.0:
+        current_T_val = 200.0
 
     prev_z_key = None     
     prev_target_s = None  
 
-    for i, z_val in enumerate(used_z_steps):
+    for i, (z_val, frac_start, frac_end) in enumerate(spatial_layers):
         z_key = min(stack.keys(), key=lambda x: abs(x - z_val))
         layer_data = stack[z_key]
         stepper = get_stepper(layer_data)
-        
-        lp_start = env_boundaries[i]
-        lp_end = env_boundaries[i+1]
+
+        lp_start = curr_lp_bar + frac_start * (final_lp_bar - curr_lp_bar)
+        lp_end   = curr_lp_bar + frac_end   * (final_lp_bar - curr_lp_bar)
 
         def temp_error(s_guess):
             try:
@@ -265,8 +309,35 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
     except Exception:
         target_s = 3000.0
 
-    pre_core = integrate_core(Pc_bar, params['M_rock'], T_center=5000.0, iron_fraction=iron_frac)
+    # 1) Cheap first pass: T_center loosely scaled from T_surf
+    T_surf = params.get('T_surf', 500.0)
+    T_pre_guess = max(T_surf * 3.0, 1500.0)   # ~1.5–3k K for cool worlds, more for hot
+    pre_core = integrate_core(Pc_bar, params['M_rock'],
+                            T_center=T_pre_guess, iron_fraction=iron_frac)
+    if not pre_core['valid']:
+        return None
+
+    # 2) Quick rough envelope to read the temperature at top-of-rock
     P_rock_top_guess = pre_core['P_top']
+    if P_rock_top_guess > params['P_surf'] + 0.1:
+        try:
+            rough_env = build_staircase_envelope(
+                params['P_surf'], P_rock_top_guess,
+                T_surf, params['z_profile'], fluid_stack, debug=False
+            )
+            if rough_env is not None:
+                T_top_rock = 10 ** float(rough_env['t'](np.log10(P_rock_top_guess)))
+                if np.isfinite(T_top_rock):
+                    # 3) Refine pre_core with that temperature
+                    pre_core = integrate_core(Pc_bar, params['M_rock'],
+                                            T_center=T_top_rock * 1.5,
+                                            iron_fraction=iron_frac)
+                    if not pre_core['valid']:
+                        return None
+                    P_rock_top_guess = pre_core['P_top']
+        except Exception:
+            pass
+
     p_log_core = np.log10(max(1e-5, P_rock_top_guess))
 
     mantle_stepper = get_stepper(water_eos)
@@ -281,11 +352,39 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
     Rho_core_match = 10 ** lrho_core 
     T_center_calc = T_core_match * (Pc_bar / max(1e-5, P_rock_top_guess)) ** 0.1
 
-    core_res = integrate_core(
-        Pc_bar, params['M_rock'], T_center=T_center_calc, 
-        iron_fraction=iron_frac, env_rho_base=Rho_core_match, nabla_ad=0.1
-    )
-    if not core_res['valid']: return None
+    # --- Iterate to align rock-end T with water-side adiabat at the ACTUAL P_rock_top ---
+    core_res = None
+    for _ in range(3):
+        core_res = integrate_core(
+            Pc_bar, params['M_rock'], T_center=T_center_calc,
+            iron_fraction=iron_frac, env_rho_base=Rho_core_match, nabla_ad=0.1
+        )
+        if not core_res['valid']:
+            return None
+
+        P_rock_top_actual = core_res['P_top']
+        p_log_actual = np.log10(max(1e-5, P_rock_top_actual))
+
+        lt_water_top, _ = mantle_stepper.get_state(
+            p_log_actual, np.log10(core_res['T'][-1]), target_s
+        )
+        if not np.isfinite(lt_water_top):
+            break  # stepper failed — keep current core_res
+
+        T_water_top = 10 ** lt_water_top
+        new_T_center = T_water_top * (Pc_bar / max(1e-5, P_rock_top_actual)) ** 0.1
+
+        # Converged when rock-end T matches water-side T to < 0.1%
+        if abs(core_res['T'][-1] - T_water_top) / T_water_top < 1e-3:
+            T_core_match = T_water_top
+            T_center_calc = new_T_center
+            break
+
+        T_core_match = T_water_top
+        T_center_calc = new_T_center
+
+    if not core_res['valid']:
+        return None
         
     P_rock_top = core_res['P_top']
     R_rock = core_res['R_core']
@@ -410,9 +509,16 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
     c_info = utils.calculate_staircase_dt_ds(result, t_eff)
     result["dt_ds_total"] = c_info['total_dt_ds']
     result["dt_ds_layers"] = c_info['layer_contributions']
+
+    thermal_contrast = utils.calculate_thermal_contrast(result)
+    result["T_top_static"] = thermal_contrast['T_top']
+    result["T_cmb_static"] = thermal_contrast['T_deep']
+    result["Delta_T_blanket"] = thermal_contrast['Delta_T']
+    result["Delta_S_blanket"] = thermal_contrast['Delta_S']
     
     return result
 
+@time_it
 def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
     Pc_bar = 10 ** logPc
     debug = params.get('debug', False)
@@ -421,12 +527,35 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
     iron_frac = params.get('iron_fraction', 0.33)
     target_water_mass = params['M_water']
 
-    pre_core = integrate_core(Pc_bar, params['M_rock'], T_center=5000.0, iron_fraction=iron_frac)
-    
+    # 1) Cheap first pass: T_center loosely scaled from T_surf
+    T_surf = params.get('T_surf', 500.0)
+    T_pre_guess = max(T_surf * 3.0, 1500.0)   # ~1.5–3k K for cool worlds, more for hot
+    pre_core = integrate_core(Pc_bar, params['M_rock'],
+                            T_center=T_pre_guess, iron_fraction=iron_frac)
     if not pre_core['valid']:
         return None
-        
+
+    # 2) Quick rough envelope to read the temperature at top-of-rock
     P_rock_top_guess = pre_core['P_top']
+    if P_rock_top_guess > params['P_surf'] + 0.1:
+        try:
+            rough_env = build_staircase_envelope(
+                params['P_surf'], P_rock_top_guess,
+                T_surf, params['z_profile'], fluid_stack, debug=False
+            )
+            if rough_env is not None:
+                T_top_rock = 10 ** float(rough_env['t'](np.log10(P_rock_top_guess)))
+                if np.isfinite(T_top_rock):
+                    # 3) Refine pre_core with that temperature
+                    pre_core = integrate_core(Pc_bar, params['M_rock'],
+                                            T_center=T_top_rock * 1.5,
+                                            iron_fraction=iron_frac)
+                    if not pre_core['valid']:
+                        return None
+                    P_rock_top_guess = pre_core['P_top']
+        except Exception:
+            pass
+
     logP_rock_top = np.log10(max(1e-5, P_rock_top_guess))
 
     if P_rock_top_guess <= params['P_surf'] + 0.1:
@@ -546,8 +675,8 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
 # =============================================================================
 # 4. GENERIC PLANET INTEGRATOR (Gas Giant / Sub-Neptune)
 # =============================================================================
-
-def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
+@time_it
+def integrate_planet(logPc: float, params: dict, eos_data: dict, nabla_ad: float=0) -> dict:
     debug = params.get('debug', False)
     Pc_bar = 10 ** logPc
     iron_frac = params.get('iron_fraction', 0.33)
@@ -561,34 +690,26 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
     P_int_guess = pilot_core['P_top']
     
     if P_int_guess <= params['P_surf']:
-        result = {
-            "M_total": pilot_core['M_actual'], "R_total": pilot_core['R_core'], 
-            "M_core_actual": pilot_core['M_actual'],
-            "R": pilot_core['R'], "M": pilot_core['M'], "P": pilot_core['P'], 
-            "Rho": pilot_core['Rho'], "T": pilot_core['T'], "S": pilot_core['S'], "Z": pilot_core['Z'], 
-            "R_rock": pilot_core['R_core'], "R_int": pilot_core['R_core']
-        }
-        result["M_Z_total"] = pilot_core['M_actual']
-        result["dt_ds_total"] = np.inf
-        result["dt_ds_layers"] = {}
-        return result
+        return None 
+    
+    # --- Pass 1: rough envelope to get interface temperature ---
 
     try:
-        env = build_staircase_envelope(
+        env_rough = build_staircase_envelope(
             params['P_surf'], P_int_guess, params['T_surf'], params['z_profile'], eos_data['fluid'], debug=debug
         )
     except Exception as e:
         logging.warning(f"      ⚠️ [Physics] logPc={logPc:.2f} failed: Envelope EOS crashed -> {e}")
         return None
         
-    if env is None:
+    if env_rough is None:
         logging.warning(f"      ⚠️ [Physics] logPc={logPc:.2f} failed: Envelope builder returned None.")
         return None
 
     try:
-        T_match = 10 ** float(env['t'](np.log10(P_int_guess)))
+        T_match = 10 ** float(env_rough['t'](np.log10(P_int_guess)))
         if np.isnan(T_match): T_match = 5000.0
-        Rho_match = 10 ** float(env['rho'](np.log10(P_int_guess)))
+        Rho_match = 10 ** float(env_rough['rho'](np.log10(P_int_guess)))
         if np.isnan(Rho_match): Rho_match = 0.0
     except Exception:
         T_match = 5000.0
@@ -598,19 +719,35 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
         Pc_bar, params['M_core'], T_center=T_match, iron_fraction=iron_frac
     )
     P_int_predict = predictor_core['P_top']
-    T_center_calc = T_match * (Pc_bar / max(1e-5, P_int_predict)) ** 0.1
+    T_center_calc = T_match * (Pc_bar / max(1e-5, P_int_predict)) ** nabla_ad
 
     final_core = integrate_core(
         Pc_bar, params['M_core'], T_center=T_center_calc, 
-        iron_fraction=iron_frac, env_rho_base=Rho_match, nabla_ad=0.1
+        iron_fraction=iron_frac, env_rho_base=Rho_match, nabla_ad=nabla_ad
     )
     
     P_int_final = final_core['P_top']
-    R_int_final = final_core['R_core']
     
     if P_int_final <= params['P_surf']:
         logging.warning(f"      ⚠️ [Physics] logPc={logPc:.2f} failed: Core breached the {params['P_surf']} bar surface.")
         return None
+    
+    # --- Pass 2: rebuild envelope for the ACTUAL interface pressure ---
+    # This ensures the interpolator domain exactly covers [P_surf, P_int_final]
+    # and eliminates all extrapolation artifacts.
+
+    try:
+        env = build_staircase_envelope(
+            params['P_surf'], P_int_final, params['T_surf'],
+            params['z_profile'], eos_data['fluid'], debug=debug
+        )
+    except Exception as e:
+        logging.warning(f"      ⚠️ [Physics] Pass 2 envelope crashed: {e}")
+        return None
+    if env is None:
+        return None
+
+    R_int_final = final_core['R_core']
 
     r = R_int_final
     m = final_core['M_actual']
@@ -681,5 +818,12 @@ def integrate_planet(logPc: float, params: dict, eos_data: dict) -> dict:
     c_info = utils.calculate_staircase_dt_ds(result, t_eff)
     result["dt_ds_total"] = c_info['total_dt_ds']
     result["dt_ds_layers"] = c_info['layer_contributions']
+
+    # Evaluate static thermal blanketing for coupled profiles
+    thermal_contrast = utils.calculate_thermal_contrast(result)
+    result["T_top_static"] = thermal_contrast['T_top']
+    result["T_cmb_static"] = thermal_contrast['T_deep']
+    result["Delta_T_blanket"] = thermal_contrast['Delta_T']
+    result["Delta_S_blanket"] = thermal_contrast['Delta_S']
 
     return result

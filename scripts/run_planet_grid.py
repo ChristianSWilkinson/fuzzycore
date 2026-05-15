@@ -50,18 +50,6 @@ def find_initial_guess(p_surf: float, t_surf: float, m_core: float,
     """
     Scans the historical results CSV to find the closest successful trial 
     and uses its central pressure as a warm-start guess for the root-finder.
-    
-    Args:
-        p_surf (float): Surface pressure in bar.
-        t_surf (float): Surface temperature in K.
-        m_core (float): Input core mass in Earth masses.
-        sigma (float): Diluteness parameter.
-        target_val (float): Target total mass in kg.
-        mode (str): Convergence mode ('mass').
-        csv_file (str): Path to the results database.
-        
-    Returns:
-        float: A log10(Pc) initial guess.
     """
     target_mj = target_val / c.M_JUPITER
     default_guess = 10.5 if target_mj <= 1.0 else 11.5
@@ -105,13 +93,12 @@ def run_single_grid_point(args: tuple, csv_file: str, p_surf_val: float,
                           mode: str, z_base: float, iron_frac: float) -> dict:
     """
     Worker function executed by the multiprocessing pool for a single grid coordinate.
-    
-    Builds the structural parameters, fetches a warm-start guess, invokes the 
-    hydrostatic solver, and writes the output to the shared CSV.
     """
     trial_id, target_val, t_surf, m_core_val, sigma = args
     
     # Initialize the output dictionary with NaNs
+    # Pre-allocating the thermal contrast keys guarantees the CSV columns stay aligned 
+    # even if a failed trial skips the calculation block entirely.
     output = {
         'trial_id': trial_id,
         'target_mode': mode,
@@ -126,6 +113,19 @@ def run_single_grid_point(args: tuple, csv_file: str, p_surf_val: float,
         'Z_base': z_base,
         'Iron_Fraction': iron_frac,
         'P_center_bar': np.nan,
+        # --- ALL THERMAL CONTRAST OUTPUTS PRE-ALLOCATED ---
+        'T_deep': np.nan,
+        'T_top': np.nan,
+        'Delta_T': np.nan,
+        'S_deep': np.nan,
+        'S_top': np.nan,
+        'Delta_S': np.nan,
+        'dt_ds_total': np.nan,
+        # --- DDC PROOF VARIABLES ---
+        'DDC_Match_Ratio': np.nan,
+        'Grad_Fuzzy': np.nan,
+        'Grad_DDC': np.nan,
+        # --------------------------------------------------
         'status': 'pending'
     }
     
@@ -151,12 +151,18 @@ def run_single_grid_point(args: tuple, csv_file: str, p_surf_val: float,
             'z_base': z_base,
             'initial_log_pc': log_pc_guess,
             'iron_fraction': iron_frac, 
-            'debug': False
+            'debug': False,
+            'T_deep': np.nan,
+            'T_top': np.nan,
+            'Delta_T': np.nan,
+            'S_deep': np.nan,
+            'S_top': np.nan,
+            'Delta_S': np.nan,
         }
         
         # --- EXECUTE SOLVER ---
         result = solver.solve_structure(
-            target_val, current_params, mode, trial_id, csv_file, write_lock
+            target_val, current_params, mode, trial_id
         )
         
         # --- MEMORY CLEANUP ---
@@ -171,6 +177,31 @@ def run_single_grid_point(args: tuple, csv_file: str, p_surf_val: float,
             output['M_Z_total_Me'] = result['M_Z_total'] / c.M_EARTH
             output['P_center_bar'] = 10 ** result['P'][0]
             
+            # --- DT_DS_TOTAL EXTRACTION ---
+            output['dt_ds_total'] = result.get('dt_ds_total', np.nan)
+            
+            # --- DYNAMIC THERMAL CONTRAST EXTRACTION ---
+            thermal_contrast = utils.calculate_thermal_contrast(result)
+            if isinstance(thermal_contrast, dict):
+                for key, val in thermal_contrast.items():
+                    if key in output:
+                        output[key] = val
+
+            # --- DDC PROOF CALCULATION ---
+            t_int_val = current_params.get('T_int', current_params['T_surf'])
+            ddc_proof = utils.verify_ddc_macroscopic_gradient(
+                results=result, 
+                t_int=t_int_val, 
+                lambda_cd=10.0,   
+                Ra_T=1e8,         
+                l_H=0.1           
+            )
+            print(ddc_proof)
+            if ddc_proof.get('valid', False):
+                output['DDC_Match_Ratio'] = ddc_proof.get('match_ratio', np.nan)
+                output['Grad_Fuzzy'] = ddc_proof.get('grad_fuzzy', np.nan)
+                output['Grad_DDC'] = ddc_proof.get('grad_ddc', np.nan)
+
             # Filter out completely unphysical radius blowouts
             total_r = output['R_total_Rj']
             if not np.isnan(total_r) and 0.4 < total_r < 2.5: 
@@ -188,6 +219,7 @@ def run_single_grid_point(args: tuple, csv_file: str, p_surf_val: float,
     # Safely write the final row to the database
     try:
         with write_lock:
+            # Reorder dict slightly to make sure the pandas dataframe is consistent
             df_out = pd.DataFrame([output])
             file_exists = os.path.exists(csv_file)
             df_out.to_csv(csv_file, mode='a', header=not file_exists, index=False)
@@ -215,7 +247,6 @@ def main():
     if os.path.exists(OUTPUT_FILE):
         try:
             df_existing = pd.read_csv(OUTPUT_FILE, usecols=['trial_id'])
-            # Convert to string to avoid type mismatches
             completed_trials = set(df_existing['trial_id'].dropna().astype(str).tolist())
             print(f"[*] Found {len(completed_trials)} already completed trials in {OUTPUT_FILE}.")
         except Exception as e:
@@ -250,21 +281,18 @@ def main():
         
         for t_k in TEMPS_K:
             for m_c, sig in grid_points:
-                # Deterministic ID based on exact coordinate
                 trial_id = f"M{m_mj}_T{t_k}_{trial_idx}"
                 total_models_in_grid += 1
                 
-                # Only append the task if it hasn't been solved in a previous run
                 if trial_id not in completed_trials:
                     tasks.append((trial_id, target_mass, t_k, m_c, sig))
                 
                 trial_idx += 1
                 
-    # Reserve two cores for OS stability
     N_CORES = max(1, mp.cpu_count() - 2) 
+    #N_CORES = 1
     
     # --- 3. RANDOMIZE EXECUTION ORDER ---
-    # Shuffling prevents the grid from getting "stuck" in a slow region of phase space
     print(f"[*] Shuffling {len(tasks)} remaining tasks (out of {total_models_in_grid} total grid points)...")
     random.shuffle(tasks)
     
@@ -272,7 +300,6 @@ def main():
         print("[*] All grid points are already completed! Exiting.")
         return
 
-    # Package the static arguments into the worker function
     worker_func = partial(
         run_single_grid_point, 
         csv_file=OUTPUT_FILE,
@@ -285,8 +312,6 @@ def main():
     print(f"[*] Starting execution pool with {N_CORES} CPU cores.")
     print(f"[*] Results appending to {OUTPUT_FILE}...")
     
-    # Use maxtasksperchild=5 to periodically kill and restart worker processes,
-    # preventing memory fragmentation leaks in C-level Scipy interpolators.
     with mp.Pool(processes=N_CORES, maxtasksperchild=5) as pool:
         pool.map(worker_func, tasks)
 

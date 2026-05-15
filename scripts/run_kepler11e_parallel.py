@@ -58,7 +58,7 @@ def get_params(m_core: float, sigma: float) -> dict:
         'z_profile': z_prof,             # Unrounded, continuous profile as requested
         'sigma_val': sigma,              
         'iron_fraction': 0.33,          
-        'debug': True,
+        'debug': False,
         'initial_log_pc': 7
     }
 
@@ -68,9 +68,7 @@ def find_conserved_sigma(m_core: float, target_mz_me: float, lock, hint_sigma: f
     Optimizes the sigma parameter using a robust array-based scouting system.
     Safely bypasses discontinuous runaway-gas cliffs at low sigma values.
     """
-    import fuzzycore.eos as eos
-    from scipy.optimize import brentq
-    
+
     class ConvergenceSuccess(Exception):
         def __init__(self, sigma): self.sigma = sigma
 
@@ -80,8 +78,7 @@ def find_conserved_sigma(m_core: float, target_mz_me: float, lock, hint_sigma: f
     def eval_sigma(sig_guess: float) -> float:
         """Evaluates planet and raises ConvergenceSuccess if threshold is met."""
         p = get_params(m_core, sig_guess)
-        res = solver.solve_structure(M_KEPLER11E, p, 'mass', 'opt_temp', os.devnull, lock)
-        eos._MIXED_CACHE.clear()
+        res = solver.solve_structure(M_KEPLER11E, p, 'mass', 'opt_temp')
 
         if res is None:
             raise ValueError("Unphysical: Planet Unbound or on Runaway Cliff")
@@ -181,9 +178,8 @@ def run_single_model(args: tuple, lock) -> tuple:
             params=params,
             mode='mass',
             trial_id=trial_id,
-            csv_file=worker_temp_file,
-            write_lock=lock
         )
+        eos._MIXED_CACHE.clear()
         
         if os.path.exists(worker_temp_file):
             try: os.remove(worker_temp_file)
@@ -198,23 +194,18 @@ def run_single_model(args: tuple, lock) -> tuple:
                 if abs(m_z_tot_me - target_mz_me) > 0.05:
                     return False, m_core, track_name, "Conservation failed"
 
-            # 🛑 THE FIX: Removed 'if mode_type == Direct' restriction!
-            # This now runs for BOTH Bulk and Direct tracks.
             match_ratio, grad_fuzzy, grad_ddc = np.nan, np.nan, np.nan
-            try:
-                ddc_proof = utils.verify_ddc_macroscopic_gradient(
-                    results=res, 
-                    t_int=params.get('T_int', params['T_surf']), 
-                    lambda_cd=10.0,   
-                    Ra_T=1e8,         
-                    l_H=0.1           
-                )
-                if ddc_proof.get('valid', False):
-                    match_ratio = ddc_proof['match_ratio']
-                    grad_fuzzy = ddc_proof['grad_fuzzy']
-                    grad_ddc = ddc_proof['grad_ddc']
-            except Exception:
-                pass
+            ddc_proof = utils.verify_ddc_macroscopic_gradient(
+                results=res, 
+                t_int=params.get('T_int', params['T_surf']), 
+                lambda_cd=10.0,   
+                Ra_T=1e8,         
+                l_H=0.1           
+            )
+            if ddc_proof.get('valid', False):
+                match_ratio = ddc_proof['match_ratio']
+                grad_fuzzy = ddc_proof['grad_fuzzy']
+                grad_ddc = ddc_proof['grad_ddc']
 
             m_dilute = max(m_z_tot_me - m_core, 0.0)
             
@@ -227,10 +218,25 @@ def run_single_model(args: tuple, lock) -> tuple:
                 'R_total_Re': r_tot_re,
                 'Sigma_Used': sigma,
                 'dt_ds_total': res.get('dt_ds_total', np.nan),
-                'DDC_Match_Ratio': match_ratio, # Now populated for Bulk!
+                'DDC_Match_Ratio': match_ratio,
                 'Grad_Fuzzy': grad_fuzzy,
-                'Grad_DDC': grad_ddc
+                'Grad_DDC': grad_ddc,
+                # --- ALL THERMAL CONTRAST OUTPUTS PRE-ALLOCATED ---
+                'T_deep': np.nan,
+                'T_top': np.nan,
+                'Delta_T': np.nan,
+                'S_deep': np.nan,
+                'S_top': np.nan,
+                'Delta_S': np.nan,
             }
+
+            # Inject the thermal contrasts cleanly
+            thermal_contrast = utils.calculate_thermal_contrast(res)
+            if isinstance(thermal_contrast, dict):
+                for key, val in thermal_contrast.items():
+                    if key in result_dict:
+                        result_dict[key] = val
+                        print(result_dict[key])
             
             proof_str = f" | DDC Proof: {match_ratio:.3f}" if not np.isnan(match_ratio) else ""
             print(f"  [+] {track_name} | Core: {m_core:.2f} -> R = {r_tot_re:.2f} R_E{proof_str}")
@@ -256,11 +262,11 @@ if __name__ == '__main__':
     print("================================================================")
     
     TRACKS = [
-        #{"name": "Bulk Envelope Transfer", "type": "Bulk", "target_mz_me": 7.9},
-        #{"name": "Direct Metal (Total Z = 7.5 M_E)", "type": "Direct", "target_mz_me": 7.5},
+        {"name": "Bulk Envelope Transfer", "type": "Bulk", "target_mz_me": 7.9},
+        {"name": "Direct Metal (Total Z = 7.5 M_E)", "type": "Direct", "target_mz_me": 7.5},
         {"name": "Direct Metal (Total Z = 7.0 M_E)", "type": "Direct", "target_mz_me": 7.0},
-        #{"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
-        #{"name": "Direct Metal (Total Z = 5.0 M_E)", "type": "Direct", "target_mz_me": 5.0},
+        {"name": "Direct Metal (Total Z = 6.0 M_E)", "type": "Direct", "target_mz_me": 6.0},
+        {"name": "Direct Metal (Total Z = 5.0 M_E)", "type": "Direct", "target_mz_me": 5.0},
     ]
     
     completed_tasks = set()
@@ -315,7 +321,7 @@ if __name__ == '__main__':
     
     if tasks_to_run:
         n_workers = min(mp.cpu_count() - 1, 1)
-        n_workers = max(1, n_workers) 
+        #n_workers = max(1, n_workers) 
         
         print(f"[*] Starting parallel execution with {n_workers} workers...")
         manager = mp.Manager()

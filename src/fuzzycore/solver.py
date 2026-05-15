@@ -8,6 +8,7 @@ Water Worlds) and tracks intermediate solutions during the solving process.
 """
 
 import os
+import logging
 
 import numpy as np
 from scipy.optimize import brentq
@@ -15,8 +16,46 @@ from scipy.optimize import brentq
 from . import constants as c
 from . import eos
 from . import physics
+from .utils import time_it
 
+# Module-level cache that persists across solve_structure calls within one process.
+# Key: (m_core_kg_rounded, logPc_rounded, sigma_bin, target_val_rounded)
+# Value: error (float)
+_OBJECTIVE_CACHE: dict = {}
 
+def _objective_cache_key(params: dict, log_pc: float, target_val: float):
+    m_core = params.get('M_core', params.get('M_rock', 0.0))
+    sigma  = params.get('sigma_val', 0.0)
+    p_surf = params.get('P_surf', 1.0)
+    t_surf = params.get('T_surf', 200.0)
+    y_rat  = params.get('Y_ratio', 0.26)
+
+    # Profile fingerprint: bytes-hash of the rounded array. Two profiles that
+    # round identically to 4 decimals will share interpolators in the EOS
+    # stack anyway, so they're cache-equivalent. Anything else collides only
+    # if it's genuinely the same physics.
+    z_profile = params.get('z_profile')
+    if z_profile is not None:
+        z_fp = hash(np.round(np.asarray(z_profile, dtype=float), 4).tobytes())
+    else:
+        z_fp = 0
+
+    return (
+        round(float(m_core),     6),
+        round(float(log_pc),     4),
+        round(float(sigma),      3),
+        round(float(target_val), 6),
+        round(float(p_surf),     6),
+        round(float(t_surf),     3),
+        round(float(y_rat),      4),
+        z_fp,
+    )
+
+def clear_objective_cache() -> None:
+    """Call between independent planet targets (e.g. new M_KEPLER11E, new track)."""
+    _OBJECTIVE_CACHE.clear()
+
+@time_it
 def solve_structure(target_val: float, params: dict, mode: str, 
                     trial_id: str) -> dict:
     """
@@ -101,16 +140,20 @@ def solve_structure(target_val: float, params: dict, mode: str,
     
     eval_cache = {}
 
+    @time_it
     def objective(log_pc: float) -> float:
-        """
-        Integrates the planet for a guessed central pressure (log_pc) 
-        and returns the error relative to the target mass/gravity.
-        """
         log_pc_rounded = round(float(log_pc), 12)
         if log_pc_rounded in eval_cache:
             return eval_cache[log_pc_rounded]
 
-        # 🛑 TRIPWIRE: Announce the attempt
+        # Cross-call cache: hit when the SAME (m_core, logPc, sigma_bin, target) was seen
+        # in a previous solve_structure call (typically: failure points from prior sigma probes).
+        module_key = _objective_cache_key(params, log_pc, target_val)
+        if module_key in _OBJECTIVE_CACHE:
+            cached = _OBJECTIVE_CACHE[module_key]
+            eval_cache[log_pc_rounded] = cached
+            return cached
+
         if params.get('debug'):
             print(f"\n    [Objective Attempt] logPc: {log_pc:.4f} (Pc: {10**log_pc:.2e} bar)")
 
@@ -121,44 +164,35 @@ def solve_structure(target_val: float, params: dict, mode: str,
             else:
                 res = physics.integrate_planet(log_pc, params, eos_data)
                 interior_mass = params['M_core']
-            
-            # --- THE FIX: SMART FALLBACK ERROR ---
-            if res is None or np.isnan(res['M'][-1]):
-                # If physics integration fails completely (usually because pressure is too weak),
-                # we force a strongly negative synthetic error to push brentq to hunt higher pressures.
-                error = -1e20 + (log_pc * 1e18) 
-                
-                if params.get('debug'):
-                    print(f"      ❌ FAILURE: Integration returned None (Unbound) | Synthetic Error: {error:.2e}")
-                    
-            elif res['M'][-1] < (interior_mass * 0.99):
-                # If it stalled prematurely, also push higher
-                error = -1e19 + (log_pc * 1e17)
 
+            if res is None or np.isnan(res['M'][-1]):
+                error = 1e30
+                if params.get('debug'):
+                    print(f"      ❌ FAILURE: Integration returned None | Synthetic Error: {error:.2e}")
+            elif res['M'][-1] < (interior_mass * 0.99):
+                error = -1e30
                 if params.get('debug'):
                     print(f"      ❌ FAILURE: Integration Prematurely Stalled | Synthetic Error: {error:.2e}")
-                    
             else:
                 actual_m = res['M'][-1]
                 actual_r = res['R'][-1]
-                
-                # Calculate final error (NO CSV WRITING HAPPENS HERE ANYMORE = MASSIVE SPEEDUP)
                 if mode == 'gravity':
                     g_surf = (c.G_CONST * actual_m) / (actual_r ** 2)
                     error = g_surf - target_val
                 elif mode == 'mass':
                     error = actual_m - target_val
-                
                 if params.get('debug'):
-                    print(f"      ✅ SUCCESS: Mass Achieved: {actual_m/c.M_EARTH:.3f} Me | Error: {error/c.M_EARTH:+.3f} Me")
-            
+                    print(f"      ✅ SUCCESS: Mass: {actual_m/c.M_EARTH:.3f} Me | Err: {error/c.M_EARTH:+.3f} Me")
+
             eval_cache[log_pc_rounded] = error
+            _OBJECTIVE_CACHE[module_key] = error            # <-- write-through
             return error
-                
+
         except Exception as e:
             if params.get('debug'):
                 print(f"      💥 CRASH in Objective: {str(e)}")
             eval_cache[log_pc_rounded] = -1e20
+            _OBJECTIVE_CACHE[module_key] = -1e20            # <-- write-through
             return -1e20
 
     # =========================================================================
@@ -209,25 +243,50 @@ def solve_structure(target_val: float, params: dict, mode: str,
             break
 
     # --- C. Fallback Global Grid ---
+    # ─────────────────────────────────────────────────────────────────────────
+    # Cliff bisection: zoom in on the fail/success transition, then check
+    # whether the cliff itself brackets the target.
+    # ─────────────────────────────────────────────────────────────────────────
     if not bracket:
-        if params.get('debug'):
-            print("  [Solver] Concentric search failed. Launching ultra-wide global fallback grid...")
-        
-        # SPEEDUP: Reduced from 25 points to 15 points
-        global_pts = np.linspace(min_pc, max_pc, 15)
-        for p_test in global_pts:
-            err = objective(p_test)
-            if abs(err) < 1e29:
-                valid_evals.append((p_test, err))
-                valid_evals.sort(key=lambda x: x[0])
-                for i in range(len(valid_evals) - 1):
-                    if np.sign(valid_evals[i][1]) != np.sign(valid_evals[i+1][1]):
-                        bracket = (valid_evals[i][0], valid_evals[i+1][0])
-                        break
-            if bracket:
-                if params.get('debug'):
-                    print(f"  [Solver] ✅ Root globally bracketed between {bracket[0]:.3f} and {bracket[1]:.3f}!")
-                break
+        fail_pc = max((p for p, e in eval_cache.items() if e > 1e29),  default=None)
+        succ_pc = min((p for p, e in eval_cache.items() if abs(e) < 1e29), default=None)
+
+        if fail_pc is not None and succ_pc is not None and succ_pc > fail_pc:
+            if params.get('debug'):
+                print(f"  [Solver] Bisecting cliff between fail={fail_pc:.3f} and succ={succ_pc:.3f}...")
+
+            while succ_pc - fail_pc > 0.001:
+                mid = 0.5 * (fail_pc + succ_pc)
+                err = objective(mid)
+                if abs(err) < 1e29:
+                    succ_pc = mid
+                else:
+                    fail_pc = mid
+
+            # Rebuild valid_evals from the cache so we see ALL successful points,
+            # including everything bisection just added.
+            valid_evals = sorted(
+                (p, e) for p, e in eval_cache.items() if abs(e) < 1e29
+            )
+
+            # Now look for a sign change anywhere in the enriched evaluation set
+            for i in range(len(valid_evals) - 1):
+                if np.sign(valid_evals[i][1]) != np.sign(valid_evals[i + 1][1]):
+                    bracket = (valid_evals[i][0], valid_evals[i + 1][0])
+                    if params.get('debug'):
+                        print(f"  [Solver] ✅ Bracket found post-bisection: "
+                            f"[{bracket[0]:.4f}, {bracket[1]:.4f}]")
+                    break
+
+            # If still no bracket and the lowest successful Pc has positive error,
+            # the target is genuinely below the integrator's reachable mass floor.
+            if not bracket:
+                min_p, min_err = valid_evals[0]
+                if min_err > 0:
+                    print(f"  [Solver] Target unreachable: minimum achievable mass at "
+                        f"this composition is {(target_val + min_err)/c.M_EARTH:.2f} Me, "
+                        f"target was {target_val/c.M_EARTH:.2f} Me.")
+                    return None
 
     if not bracket:
         print(f"  ❌ [Solver] FATAL: Could not bracket the root! Planet is physically impossible.")
@@ -238,14 +297,36 @@ def solve_structure(target_val: float, params: dict, mode: str,
     # 5. Final Convergence (Brent's Method)
     # =========================================================================
     try:
-        if bracket:
-            # Brentq is super fast because the bracket bounds are loaded from the eval_cache!
-            root = brentq(objective, bracket[0], bracket[1], xtol=1e-7)
-            
-            if is_water_world:
-                return physics.integrate_water_world(root, params, eos_data)
-            return physics.integrate_planet(root, params, eos_data)
-            
+        root = brentq(objective, bracket[0], bracket[1], xtol=1e-5)
+
+        if is_water_world:
+            final_result = physics.integrate_water_world(root, params, eos_data)
+        else:
+            final_result = physics.integrate_planet(root, params, eos_data)
+
+        if final_result is None:
+            return None
+
+        achieved = final_result['M'][-1]
+        rel_err = abs(achieved - target_val) / target_val
+
+        if rel_err > 0.05:
+            logging.warning(
+                f"Solver converged to wrong mass: {achieved/c.M_EARTH:.2f} "
+                f"vs {target_val/c.M_EARTH:.2f} Mₑ"
+            )
+            return None
+
+        if rel_err > 1e-3:
+            logging.warning(
+                f"Soft mass disagreement: brentq root gave {achieved/c.M_EARTH:.3f} Mₑ "
+                f"vs target {target_val/c.M_EARTH:.3f} Mₑ (rel_err={rel_err:.2e}). "
+                f"Consider clear_objective_cache() if profile changed."
+            )
+            # fall through — still return the result, just flagged
+
+        return final_result
+
     except Exception as e:
         if params.get('debug'):
             print(f"  [Solver] Root finding failed: {e}")
