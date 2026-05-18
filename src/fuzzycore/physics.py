@@ -283,7 +283,18 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
     fluid_stack = eos_data['fluid']
     water_eos = eos_data['water']
     iron_frac = params.get('iron_fraction', 0.33)
-    
+
+    # Water-mantle thermal treatment. Override via params:
+    #   mantle_thermal_mode: 'adiabatic' (default), 'isothermal', or 'polytropic'
+    #   mantle_nabla:        d ln T / d ln P for 'polytropic' mode (unused otherwise)
+    # Defaults preserve historical adiabatic behaviour.
+    mantle_thermal_mode = params.get('mantle_thermal_mode', 'adiabatic')
+    mantle_nabla = float(params.get('mantle_nabla', 0.0))
+    if mantle_thermal_mode not in ('adiabatic', 'isothermal', 'polytropic'):
+        logging.warning(f"Unknown mantle_thermal_mode '{mantle_thermal_mode}', "
+                        f"falling back to 'adiabatic'.")
+        mantle_thermal_mode = 'adiabatic'
+
     if P_int_bar <= params['P_surf']:
         if debug: print(f"  [Water Builder] Bare Mantle Bypass! P_int ({P_int_bar:.2f}) < P_surf ({params['P_surf']:.2f})")
         env = None
@@ -339,28 +350,47 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
             pass
 
     p_log_core = np.log10(max(1e-5, P_rock_top_guess))
-
     mantle_stepper = get_stepper(water_eos)
-    t_guess_deep = T_int * (P_rock_top_guess / max(1e-5, P_int_bar)) ** 0.25
-    lt_core, lrho_core = mantle_stepper.get_state(p_log_core, np.log10(t_guess_deep), target_s)
-    
-    if np.isnan(lt_core) or np.isnan(lrho_core):
-        lt_core = np.log10(t_guess_deep)
+
+    # Compute the mantle temperature at the top of the rocky core, using the
+    # selected thermal mode.
+    if mantle_thermal_mode == 'isothermal':
+        lt_core = np.log10(T_int)
         lrho_core = float(water_eos['rho_near'](p_log_core, lt_core))
+    elif mantle_thermal_mode == 'polytropic':
+        lt_core = np.log10(T_int * (P_rock_top_guess / max(1e-5, P_int_bar)) ** mantle_nabla)
+        lrho_core = float(water_eos['rho_near'](p_log_core, lt_core))
+    else:  # 'adiabatic' — entropy-matched mantle (historical default)
+        t_guess_deep = T_int * (P_rock_top_guess / max(1e-5, P_int_bar)) ** 0.25
+        lt_core, lrho_core = mantle_stepper.get_state(p_log_core, np.log10(t_guess_deep), target_s)
+        if np.isnan(lt_core) or np.isnan(lrho_core):
+            lt_core = np.log10(t_guess_deep)
+            lrho_core = float(water_eos['rho_near'](p_log_core, lt_core))
 
     T_core_match = max(T_int, 10 ** lt_core)
     Rho_core_match = 10 ** lrho_core 
-    T_center_calc = T_core_match * (Pc_bar / max(1e-5, P_rock_top_guess)) ** 0.1
+    # Core temperature gradient: d ln T / d ln P. Override via params['core_nabla'];
+    # preserve historical water-world default of 0.1 otherwise.
+    core_nabla = params.get('core_nabla', 0.1)
+    T_center_calc = T_core_match * (Pc_bar / max(1e-5, P_rock_top_guess)) ** core_nabla
 
-    # --- Iterate to align rock-end T with water-side adiabat at the ACTUAL P_rock_top ---
+    # --- Iterate to align rock-end T with water-side adiabat at the ACTUAL P_rock_top.
+    # The iteration only makes sense in adiabatic mode (the stepper walks along an
+    # isentrope). In isothermal / polytropic modes, T at the top of the core is set
+    # parametrically and a single core integration is sufficient.
     core_res = None
-    for _ in range(3):
+    n_iter = 3 if mantle_thermal_mode == 'adiabatic' else 1
+    for _ in range(n_iter):
         core_res = integrate_core(
             Pc_bar, params['M_rock'], T_center=T_center_calc,
-            iron_fraction=iron_frac, env_rho_base=Rho_core_match, nabla_ad=0.1
+            iron_fraction=iron_frac, env_rho_base=Rho_core_match, nabla_ad=core_nabla
         )
         if not core_res['valid']:
             return None
+
+        if mantle_thermal_mode != 'adiabatic':
+            # T_core_match is parametrically determined; nothing to refine here.
+            break
 
         P_rock_top_actual = core_res['P_top']
         p_log_actual = np.log10(max(1e-5, P_rock_top_actual))
@@ -372,7 +402,7 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
             break  # stepper failed — keep current core_res
 
         T_water_top = 10 ** lt_water_top
-        new_T_center = T_water_top * (Pc_bar / max(1e-5, P_rock_top_actual)) ** 0.1
+        new_T_center = T_water_top * (Pc_bar / max(1e-5, P_rock_top_actual)) ** core_nabla
 
         # Converged when rock-end T matches water-side T to < 0.1%
         if abs(core_res['T'][-1] - T_water_top) / T_water_top < 1e-3:
@@ -399,7 +429,16 @@ def run_water_world_integration(Pc_bar: float, P_int_bar: float, params: dict, e
     
     while p_pa > P_int_bar * 1e5:
         p_log = np.log10(max(1e-5, p_pa / 1e5))
-        next_lt, next_lrho = mantle_stepper.get_state(p_log, current_lt, target_s)
+        
+        if mantle_thermal_mode == 'isothermal':
+            next_lt = np.log10(T_int)
+            next_lrho = float(water_eos['rho_near'](p_log, next_lt))
+        elif mantle_thermal_mode == 'polytropic':
+            p_bar = 10 ** p_log
+            next_lt = np.log10(T_int * (p_bar / P_int_bar) ** mantle_nabla)
+            next_lrho = float(water_eos['rho_near'](p_log, next_lt))
+        else:  # 'adiabatic' (default)
+            next_lt, next_lrho = mantle_stepper.get_state(p_log, current_lt, target_s)
 
         if np.isnan(next_lt) or np.isnan(next_lrho):
             next_lt = current_lt
@@ -527,6 +566,16 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
     iron_frac = params.get('iron_fraction', 0.33)
     target_water_mass = params['M_water']
 
+    # Water-mantle thermal treatment. Override via params:
+    #   mantle_thermal_mode: 'adiabatic' (default), 'isothermal', or 'polytropic'
+    #   mantle_nabla:        d ln T / d ln P for 'polytropic' mode (unused otherwise)
+    mantle_thermal_mode = params.get('mantle_thermal_mode', 'adiabatic')
+    mantle_nabla = float(params.get('mantle_nabla', 0.0))
+    if mantle_thermal_mode not in ('adiabatic', 'isothermal', 'polytropic'):
+        logging.warning(f"Unknown mantle_thermal_mode '{mantle_thermal_mode}', "
+                        f"falling back to 'adiabatic'.")
+        mantle_thermal_mode = 'adiabatic'
+
     # 1) Cheap first pass: T_center loosely scaled from T_surf
     T_surf = params.get('T_surf', 500.0)
     T_pre_guess = max(T_surf * 3.0, 1500.0)   # ~1.5–3k K for cool worlds, more for hot
@@ -588,24 +637,35 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
             return 1e30
 
         mantle_stepper = get_stepper(water_eos)
-        t_guess_deep = T_int * (P_rock_top_guess / max(1e-5, P_int_guess)) ** 0.25
-        
-        lt_core, lrho_core = mantle_stepper.get_state(
-            logP_rock_top, np.log10(t_guess_deep), target_s
-        )
-        
-        if np.isnan(lt_core) or np.isnan(lrho_core):
-            lt_core = np.log10(t_guess_deep)
+
+        # Compute the mantle temperature at the top of the rocky core, using the
+        # selected thermal mode (mantle_thermal_mode is read at function entry).
+        if mantle_thermal_mode == 'isothermal':
+            lt_core = np.log10(T_int)
             lrho_core = float(water_eos['rho_near'](logP_rock_top, lt_core))
-            
+        elif mantle_thermal_mode == 'polytropic':
+            lt_core = np.log10(T_int * (P_rock_top_guess / max(1e-5, P_int_guess)) ** mantle_nabla)
+            lrho_core = float(water_eos['rho_near'](logP_rock_top, lt_core))
+        else:  # 'adiabatic'
+            t_guess_deep = T_int * (P_rock_top_guess / max(1e-5, P_int_guess)) ** 0.25
+            lt_core, lrho_core = mantle_stepper.get_state(
+                logP_rock_top, np.log10(t_guess_deep), target_s
+            )
+            if np.isnan(lt_core) or np.isnan(lrho_core):
+                lt_core = np.log10(t_guess_deep)
+                lrho_core = float(water_eos['rho_near'](logP_rock_top, lt_core))
+
         T_core_match = max(T_int, 10 ** lt_core)
         Rho_core_match = 10 ** lrho_core 
 
-        T_center_calc = T_core_match * (Pc_bar / max(1e-5, P_rock_top_guess)) ** 0.1
+        # Core temperature gradient: d ln T / d ln P. Override via params['core_nabla'];
+        # preserve historical water-world default of 0.1 otherwise.
+        core_nabla = params.get('core_nabla', 0.1)
+        T_center_calc = T_core_match * (Pc_bar / max(1e-5, P_rock_top_guess)) ** core_nabla
 
         core_iter = integrate_core(
             Pc_bar, params['M_rock'], T_center=T_center_calc, 
-            iron_fraction=iron_frac, env_rho_base=Rho_core_match, nabla_ad=0.1
+            iron_fraction=iron_frac, env_rho_base=Rho_core_match, nabla_ad=core_nabla
         )
         
         if not core_iter['valid']: return 1e30
@@ -617,7 +677,16 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
 
         while p_pa > P_int_guess * 1e5:
             p_log = np.log10(max(1e-5, p_pa / 1e5))
-            next_lt, next_lrho = mantle_stepper.get_state(p_log, current_lt, target_s)
+
+            if mantle_thermal_mode == 'isothermal':
+                next_lt = np.log10(T_int)
+                next_lrho = float(water_eos['rho_near'](p_log, next_lt))
+            elif mantle_thermal_mode == 'polytropic':
+                p_bar = 10 ** p_log
+                next_lt = np.log10(T_int * (p_bar / P_int_guess) ** mantle_nabla)
+                next_lrho = float(water_eos['rho_near'](p_log, next_lt))
+            else:  # 'adiabatic' (default)
+                next_lt, next_lrho = mantle_stepper.get_state(p_log, current_lt, target_s)
 
             if np.isnan(next_lt) or np.isnan(next_lrho):
                 next_lt = current_lt
@@ -676,10 +745,16 @@ def integrate_water_world(logPc: float, params: dict, eos_data: dict) -> dict:
 # 4. GENERIC PLANET INTEGRATOR (Gas Giant / Sub-Neptune)
 # =============================================================================
 @time_it
-def integrate_planet(logPc: float, params: dict, eos_data: dict, nabla_ad: float=0) -> dict:
+def integrate_planet(logPc: float, params: dict, eos_data: dict, nabla_ad: float = None) -> dict:
     debug = params.get('debug', False)
     Pc_bar = 10 ** logPc
     iron_frac = params.get('iron_fraction', 0.33)
+
+    # Core temperature gradient: d ln T / d ln P. Allow override via
+    # params['core_nabla']; preserve historical default of 0.0 (isothermal)
+    # when neither the params key nor the explicit argument is given.
+    if nabla_ad is None:
+        nabla_ad = params.get('core_nabla', 0.0)
 
     pilot_core = integrate_core(Pc_bar, params['M_core'], T_center=5000.0, iron_fraction=iron_frac)
     
