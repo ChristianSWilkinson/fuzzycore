@@ -307,23 +307,43 @@ def solve_structure(target_val: float, params: dict, mode: str,
         if final_result is None:
             return None
 
-        achieved = final_result['M'][-1]
-        rel_err = abs(achieved - target_val) / target_val
+        achieved_mass = final_result['M'][-1]
+        achieved_r = final_result['R'][-1]
 
-        if rel_err > 0.05:
-            logging.warning(
-                f"Solver converged to wrong mass: {achieved/c.M_EARTH:.2f} "
-                f"vs {target_val/c.M_EARTH:.2f} Mₑ"
-            )
-            return None
+        # --- BUG FIX: Check convergence against the CORRECT target mode ---
+        if mode == 'mass':
+            rel_err = abs(achieved_mass - target_val) / target_val
 
-        if rel_err > 1e-3:
-            logging.warning(
-                f"Soft mass disagreement: brentq root gave {achieved/c.M_EARTH:.3f} Mₑ "
-                f"vs target {target_val/c.M_EARTH:.3f} Mₑ (rel_err={rel_err:.2e}). "
-                f"Consider clear_objective_cache() if profile changed."
-            )
-            # fall through — still return the result, just flagged
+            if rel_err > 0.05:
+                logging.warning(
+                    f"Solver converged to wrong mass: {achieved_mass/c.M_EARTH:.2f} "
+                    f"vs {target_val/c.M_EARTH:.2f} Mₑ"
+                )
+                return None
+
+            if rel_err > 1e-3:
+                logging.warning(
+                    f"Soft mass disagreement: brentq root gave {achieved_mass/c.M_EARTH:.3f} Mₑ "
+                    f"vs target {target_val/c.M_EARTH:.3f} Mₑ (rel_err={rel_err:.2e}). "
+                    f"Consider clear_objective_cache() if profile changed."
+                )
+
+        elif mode == 'gravity':
+            achieved_g = (c.G_CONST * achieved_mass) / (achieved_r ** 2)
+            rel_err = abs(achieved_g - target_val) / target_val
+
+            if rel_err > 0.05:
+                logging.warning(
+                    f"Solver converged to wrong gravity: {achieved_g:.2f} "
+                    f"vs {target_val:.2f} m/s²"
+                )
+                return None
+
+            if rel_err > 1e-3:
+                logging.warning(
+                    f"Soft gravity disagreement: brentq root gave {achieved_g:.2f} m/s² "
+                    f"vs target {target_val:.2f} m/s² (rel_err={rel_err:.2e})."
+                )
 
         return final_result
 
