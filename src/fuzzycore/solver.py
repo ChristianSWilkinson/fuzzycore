@@ -179,10 +179,12 @@ def solve_structure(target_val: float, params: dict, mode: str,
                 if mode == 'gravity':
                     g_surf = (c.G_CONST * actual_m) / (actual_r ** 2)
                     error = g_surf - target_val
+                    if params.get('debug'):
+                        print(f"      ✅ SUCCESS: Mass: {actual_m/c.M_EARTH:.3f} Me | g_surf: {g_surf:.2f} m/s² | Err: {error:+.3f} m/s²")
                 elif mode == 'mass':
                     error = actual_m - target_val
-                if params.get('debug'):
-                    print(f"      ✅ SUCCESS: Mass: {actual_m/c.M_EARTH:.3f} Me | Err: {error/c.M_EARTH:+.3f} Me")
+                    if params.get('debug'):
+                        print(f"      ✅ SUCCESS: Mass: {actual_m/c.M_EARTH:.3f} Me | Err: {error/c.M_EARTH:+.3f} Me")
 
             eval_cache[log_pc_rounded] = error
             _OBJECTIVE_CACHE[module_key] = error            # <-- write-through
