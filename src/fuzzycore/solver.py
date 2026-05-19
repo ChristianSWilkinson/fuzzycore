@@ -23,17 +23,25 @@ from .utils import time_it
 # Value: error (float)
 _OBJECTIVE_CACHE: dict = {}
 
-def _objective_cache_key(params: dict, log_pc: float, target_val: float):
-    m_core = params.get('M_core', params.get('M_rock', 0.0))
-    sigma  = params.get('sigma_val', 0.0)
-    p_surf = params.get('P_surf', 1.0)
-    t_surf = params.get('T_surf', 200.0)
-    y_rat  = params.get('Y_ratio', 0.26)
+def _objective_cache_key(params: dict, log_pc: float, target_val: float, mode: str):
+    m_core   = params.get('M_core', params.get('M_rock', 0.0))
+    m_water  = params.get('M_water', 0.0)
+    sigma    = params.get('sigma_val', 0.0)
+    p_surf   = params.get('P_surf', 1.0)
+    t_surf   = params.get('T_surf', 200.0)
+    y_rat    = params.get('Y_ratio', 0.26)
+    iron_f   = params.get('iron_fraction', 0.33)
 
-    # Profile fingerprint: bytes-hash of the rounded array. Two profiles that
-    # round identically to 4 decimals will share interpolators in the EOS
-    # stack anyway, so they're cache-equivalent. Anything else collides only
-    # if it's genuinely the same physics.
+    # Thermal-structural overrides that change the integrator's physics
+    core_nab    = params.get('core_nabla', None)            # None preserves
+                                                            # gas/water defaults
+    mantle_nab  = params.get('mantle_nabla', 0.0)
+    mantle_mode = str(params.get('mantle_thermal_mode', 'adiabatic'))
+
+    # Encode the branch explicitly to be safe at the M_water == 0 boundary.
+    is_water_world = float(m_water) > 0.0
+
+    # Profile fingerprint (unchanged)
     z_profile = params.get('z_profile')
     if z_profile is not None:
         z_fp = hash(np.round(np.asarray(z_profile, dtype=float), 4).tobytes())
@@ -42,12 +50,19 @@ def _objective_cache_key(params: dict, log_pc: float, target_val: float):
 
     return (
         round(float(m_core),     6),
+        round(float(m_water),    6),
         round(float(log_pc),     4),
         round(float(sigma),      3),
         round(float(target_val), 6),
         round(float(p_surf),     6),
         round(float(t_surf),     3),
         round(float(y_rat),      4),
+        round(float(iron_f),     4),
+        None if core_nab is None else round(float(core_nab), 4),
+        round(float(mantle_nab), 4),
+        mantle_mode,
+        bool(is_water_world),
+        str(mode),
         z_fp,
     )
 
@@ -78,6 +93,7 @@ def solve_structure(target_val: float, params: dict, mode: str,
         dict: The final converged planetary profile dictionary. Returns `None` 
             if the solver fails to find a physically valid root.
     """
+
 
     # =========================================================================
     # 0. DEBUG: ABSOLUTE INPUT INTERCEPTION (TRIPWIRE)
@@ -113,7 +129,10 @@ def solve_structure(target_val: float, params: dict, mode: str,
     y_ratio = params.get('Y_ratio', 0.26)
     
     default_z_profile = np.linspace(0.01, 1.0, 10)
-    fluid = eos.generate_fluid_interpolators(params.get('z_profile', default_z_profile))
+    fluid = eos.generate_fluid_interpolators(
+            params.get('z_profile', default_z_profile),
+            y_ratio=y_ratio,
+        )
     
     eos_data = {'rock': rock, 'fluid': fluid}
     
@@ -148,7 +167,7 @@ def solve_structure(target_val: float, params: dict, mode: str,
 
         # Cross-call cache: hit when the SAME (m_core, logPc, sigma_bin, target) was seen
         # in a previous solve_structure call (typically: failure points from prior sigma probes).
-        module_key = _objective_cache_key(params, log_pc, target_val)
+        module_key = _objective_cache_key(params, log_pc, target_val, mode)
         if module_key in _OBJECTIVE_CACHE:
             cached = _OBJECTIVE_CACHE[module_key]
             eval_cache[log_pc_rounded] = cached
@@ -166,13 +185,13 @@ def solve_structure(target_val: float, params: dict, mode: str,
                 interior_mass = params['M_core']
 
             if res is None or np.isnan(res['M'][-1]):
-                error = 1e30
+                error = np.nan
                 if params.get('debug'):
-                    print(f"      ❌ FAILURE: Integration returned None | Synthetic Error: {error:.2e}")
+                    print(f"      ❌ FAILURE: Integration returned None | marked NaN")
             elif res['M'][-1] < (interior_mass * 0.99):
-                error = -1e30
+                error = np.nan
                 if params.get('debug'):
-                    print(f"      ❌ FAILURE: Integration Prematurely Stalled | Synthetic Error: {error:.2e}")
+                    print(f"      ❌ FAILURE: Integration Prematurely Stalled | marked NaN")
             else:
                 actual_m = res['M'][-1]
                 actual_r = res['R'][-1]
@@ -185,17 +204,26 @@ def solve_structure(target_val: float, params: dict, mode: str,
                     error = actual_m - target_val
                     if params.get('debug'):
                         print(f"      ✅ SUCCESS: Mass: {actual_m/c.M_EARTH:.3f} Me | Err: {error/c.M_EARTH:+.3f} Me")
+                else:
+                    # Defensive: unknown mode -> treat as failure rather than
+                    # leaving `error` undefined.
+                    error = np.nan
 
             eval_cache[log_pc_rounded] = error
-            _OBJECTIVE_CACHE[module_key] = error            # <-- write-through
+            # Only write FINITE (i.e., real, physical) errors to the cross-call
+            # cache. Failures depend on context (different M_water, different
+            # mode, different P_surf...) so caching them across calls is what
+            # was poisoning brentq.
+            if np.isfinite(error):
+                _OBJECTIVE_CACHE[module_key] = error
             return error
 
         except Exception as e:
             if params.get('debug'):
                 print(f"      💥 CRASH in Objective: {str(e)}")
-            eval_cache[log_pc_rounded] = -1e20
-            _OBJECTIVE_CACHE[module_key] = -1e20            # <-- write-through
-            return -1e20
+            eval_cache[log_pc_rounded] = np.nan
+            # Do NOT write exception failures to the cross-call cache.
+            return np.nan
 
     # =========================================================================
     # 4. Dynamic Bounds & Concentric Bracketing Search
@@ -228,7 +256,7 @@ def solve_structure(target_val: float, params: dict, mode: str,
         if min_pc <= p_test <= max_pc:
             err = objective(p_test)
             
-            if abs(err) < 1e29:
+            if np.isfinite(err):
                 valid_evals.append((p_test, err))
                 valid_evals.sort(key=lambda x: x[0]) # Always sort by pressure
                 
@@ -250,8 +278,8 @@ def solve_structure(target_val: float, params: dict, mode: str,
     # whether the cliff itself brackets the target.
     # ─────────────────────────────────────────────────────────────────────────
     if not bracket:
-        fail_pc = max((p for p, e in eval_cache.items() if e > 1e29),  default=None)
-        succ_pc = min((p for p, e in eval_cache.items() if abs(e) < 1e29), default=None)
+        fail_pc = max((p for p, e in eval_cache.items() if not np.isfinite(e)), default=None)
+        succ_pc = min((p for p, e in eval_cache.items() if     np.isfinite(e)), default=None)
 
         if fail_pc is not None and succ_pc is not None and succ_pc > fail_pc:
             if params.get('debug'):
@@ -260,7 +288,7 @@ def solve_structure(target_val: float, params: dict, mode: str,
             while succ_pc - fail_pc > 0.001:
                 mid = 0.5 * (fail_pc + succ_pc)
                 err = objective(mid)
-                if abs(err) < 1e29:
+                if np.isfinite(err):
                     succ_pc = mid
                 else:
                     fail_pc = mid
@@ -268,7 +296,7 @@ def solve_structure(target_val: float, params: dict, mode: str,
             # Rebuild valid_evals from the cache so we see ALL successful points,
             # including everything bisection just added.
             valid_evals = sorted(
-                (p, e) for p, e in eval_cache.items() if abs(e) < 1e29
+                (p, e) for p, e in eval_cache.items() if np.isfinite(e)
             )
 
             # Now look for a sign change anywhere in the enriched evaluation set

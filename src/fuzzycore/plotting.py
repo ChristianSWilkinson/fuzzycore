@@ -48,27 +48,18 @@ def save_plot(fig, name):
 def plot_diagnostics(results, save_name="structure_diagnostics"):
     """
     Generates a 6-panel diagnostic suite for Rock-Water-Gas architectures.
-    
-    This plotting routine visualizes internal profiles including Density, Mass,
-    Temperature, Water Mass Fraction (Z), internal P-T adiabatic profile, and Entropy.
-    It dynamically shades regions representing the rock core and water mantle zones.
-
-    Args:
-        results (dict): Dictionary containing the planetary integration results 
-            (must include 'R', 'M', 'P', 'T', 'Z', 'Rho', 'S', and optionally
-            'R_int', 'R_rock', 'M_water').
-        save_name (str, optional): The filename for saving the output plot. 
-            Defaults to "structure_diagnostics".
     """
+
     if not results:
         print("No results to plot.")
         return
 
-    # 1. Extract Dimensions and Normalization
+    # ==========================
+    # Extract dimensions
+    # ==========================
     R_total = results['R'][-1]
     R_norm = results['R'] / R_total
-    
-    # Extract thermodynamic and structural profiles
+
     M = results['M']
     P = results['P']
     T = results['T']
@@ -76,99 +67,237 @@ def plot_diagnostics(results, save_name="structure_diagnostics"):
     Rho = results['Rho']
     S = results['S']
 
-    # 2. Zone Detection
-    # R_int marks the water-envelope boundary; R_rock marks the rock-water boundary
+    # ==========================
+    # Zone detection
+    # ==========================
     R_int = results.get('R_int')
     R_rock = results.get('R_rock')
     has_water = results.get('M_water', 0.0) > 0.0
 
-    # Normalize boundaries relative to total radius
     R_int_norm = (R_int / R_total) if R_int is not None else None
     R_rock_norm = (R_rock / R_total) if R_rock is not None else None
 
-    # Initialize the 2x3 plot grid
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    # ==========================
+    # Mask profiles inside core
+    # ==========================
+    Z_plot = Z.copy()
+    S_plot = S.copy()
+
+    if R_rock_norm is not None:
+        core_mask = R_norm < R_rock_norm
+        Z_plot[core_mask] = np.nan
+        S_plot[core_mask] = np.nan
+
+    # ==========================
+    # Figure setup
+    # ==========================
+    fig, axes = plt.subplots(2, 3, figsize=(20, 11))
     axes = axes.flatten()
+
+    # ==========================
+    # Scientific color palette
+    # ==========================
+    colors = {
+        "density": "#264653",      # deep teal
+        "mass": "#1d3557",         # navy
+        "temperature": "#e76f51", # warm orange-red
+        "composition": "#2a9d8f", # sea green
+        "pt": "#7b2cbf",           # rich purple
+        "entropy": "#c1121f"       # crimson-red
+    }
+
+    # ==========================
+    # Styling
+    # ==========================
+    label_style = {'fontsize': 15, 'labelpad': 6}
+    tick_size = 13
+    title_size = 16
 
     def shade(ax):
         """
-        Applies dynamic background shading to a subplot based on planetary zones.
+        Shade rock/water zones.
         """
-        # Determine the rock boundary (defaults to R_int for gas giants w/o water)
-        rock_boundary = R_rock_norm if R_rock_norm is not None else R_int_norm
-        
-        # Shade the Rock Zone
+        rock_boundary = (
+            R_rock_norm if R_rock_norm is not None
+            else R_int_norm
+        )
+
+        ymin, ymax = ax.get_ylim()
+
+        # ROCK
         if rock_boundary is not None:
-            ax.axvspan(0, rock_boundary, color='saddlebrown', alpha=0.3)
-            # va='bottom' keeps the text just above the x-axis so it doesn't get lost
-            ax.text(
-                rock_boundary / 2, 
-                ax.get_ylim()[0], 
-                "ROCK", 
-                color='saddlebrown', 
-                ha='center', 
-                va='bottom',
-                fontweight='bold', 
-                fontsize=9
+            ax.axvspan(
+                0,
+                rock_boundary,
+                color='saddlebrown',
+                alpha=0.22
             )
 
-        # Shade the Water Zone (Only if M_water is > 0 and distinct boundaries exist)
-        if has_water and R_rock_norm is not None and R_int_norm is not None:
-            ax.axvspan(R_rock_norm, R_int_norm, color='dodgerblue', alpha=0.2)
             ax.text(
-                (R_rock_norm + R_int_norm) / 2, 
-                ax.get_ylim()[0], 
-                "WATER", 
-                color='dodgerblue', 
-                ha='center', 
+                rock_boundary / 2,
+                ymin + 0.05 * (ymax - ymin),
+                "ROCK",
+                color='saddlebrown',
+                ha='center',
                 va='bottom',
-                fontweight='bold', 
-                fontsize=9
+                fontsize=12,
+                fontweight='bold'
             )
 
-    # Label styling dict to keep code clean and space efficient
-    label_style = {'fontsize': 11, 'labelpad': 2}
+        # WATER
+        if (
+            has_water
+            and R_rock_norm is not None
+            and R_int_norm is not None
+        ):
+            ax.axvspan(
+                R_rock_norm,
+                R_int_norm,
+                color='dodgerblue',
+                alpha=0.15
+            )
 
-    # Panel 0: Density (highlights rock/water plateaus)
-    axes[0].plot(R_norm, Rho / 1000.0, 'k-', lw=2)
-    axes[0].set_ylabel(r"Density [g/cm$^3$]", **label_style)
+            ax.text(
+                (R_rock_norm + R_int_norm) / 2,
+                ymin + 0.05 * (ymax - ymin),
+                "WATER",
+                color='dodgerblue',
+                ha='center',
+                va='bottom',
+                fontsize=12,
+                fontweight='bold'
+            )
+
+    # ==========================
+    # Panel 0: Density
+    # ==========================
+    axes[0].plot(
+        R_norm,
+        Rho / 1000.0,
+        lw=2.8,
+        color=colors["density"]
+    )
+    axes[0].set_ylabel(
+        r"Density [g/cm$^3$]",
+        **label_style
+    )
     shade(axes[0])
 
-    # Panel 1: Mass Distribution
-    axes[1].plot(R_norm, M / c.M_EARTH, 'b-', lw=2)
-    axes[1].set_ylabel(r"Mass [$M_\oplus$]", **label_style)
-    axes[1].set_title(f"Total Mass: {M[-1] / c.M_EARTH:.2f} $M_\\oplus$", fontsize=12)
+    # ==========================
+    # Panel 1: Mass
+    # ==========================
+    axes[1].plot(
+        R_norm,
+        M / c.M_EARTH,
+        lw=2.8,
+        color=colors["mass"]
+    )
+
+    axes[1].set_ylabel(
+        r"Mass [$M_\oplus$]",
+        **label_style
+    )
+
+    axes[1].set_title(
+        f"Total Mass: {M[-1] / c.M_EARTH:.2f} $M_\\oplus$",
+        fontsize=title_size
+    )
+
     shade(axes[1])
 
-    # Panel 2: Temperature (Log Scale required for atmospheric gradients)
-    axes[2].plot(R_norm, T, 'orange', lw=2)
+    # ==========================
+    # Panel 2: Temperature
+    # ==========================
+    axes[2].plot(
+        R_norm,
+        T,
+        lw=2.8,
+        color=colors["temperature"]
+    )
+
     axes[2].set_yscale('log')
-    axes[2].set_ylabel("Temperature [K]", **label_style)
+    axes[2].set_ylabel(
+        "Temperature [K]",
+        **label_style
+    )
+
     shade(axes[2])
 
-    # Panel 3: Compositional Profile
-    axes[3].plot(R_norm, Z, 'c-', lw=2)
-    axes[3].set_ylabel("Heavy Element Frac. (Z)", **label_style)
+    # ==========================
+    # Panel 3: Composition (Z)
+    # ==========================
+    axes[3].plot(
+        R_norm,
+        Z_plot,
+        lw=2.8,
+        color=colors["composition"]
+    )
+
+    axes[3].set_ylabel(
+        "Heavy Element Fraction (Z)",
+        **label_style
+    )
+
     shade(axes[3])
 
-    # Panel 4: P-T Profile (Internal Adiabat Phase Space)
-    axes[4].plot(P, np.log10(T), 'purple', lw=2)
-    axes[4].invert_xaxis()  # Deepest pressure on the right
-    axes[4].set_ylabel(r"$\log_{10}$ T [K]", **label_style)
-    axes[4].set_xlabel(r"$\log_{10}$ P [bar]", **label_style)
+    # ==========================
+    # Panel 4: P-T profile
+    # ==========================
+    axes[4].plot(
+        P,
+        np.log10(T),
+        lw=2.8,
+        color=colors["pt"]
+    )
 
-    # Panel 5: Entropy (Reveals layered convective jumps)
-    # Note: Entropy is usually in J/kg/K in most planetary EOS models
-    axes[5].plot(R_norm, S, 'm-', lw=2)
-    axes[5].set_ylabel("Entropy [J/kg/K]", **label_style)
+    axes[4].invert_xaxis()
+
+    axes[4].set_ylabel(
+        r"$\log_{10} T$ [K]",
+        **label_style
+    )
+
+    axes[4].set_xlabel(
+        r"$\log_{10} P$ [bar]",
+        **label_style
+    )
+
+    # ==========================
+    # Panel 5: Entropy
+    # ==========================
+    axes[5].plot(
+        R_norm,
+        S_plot,
+        lw=2.8,
+        color=colors["entropy"]
+    )
+
+    axes[5].set_ylabel(
+        "Entropy [J/kg/K]",
+        **label_style
+    )
+
     shade(axes[5])
 
-    # Set common X-axis labels for radial plots
+    # ==========================
+    # Common radial x-labels
+    # ==========================
     for ax in [axes[0], axes[1], axes[2], axes[3], axes[5]]:
-        ax.set_xlabel(r"Relative Radius ($r/R_{total}$)", **label_style)
+        ax.set_xlabel(
+            r"Relative Radius ($r/R_{total}$)",
+            **label_style
+        )
 
-    # tight_layout automatically prevents the new y-labels from overlapping adjacent subplots
+    # Tick styling
+    for ax in axes:
+        ax.tick_params(
+            axis='both',
+            labelsize=tick_size
+        )
+        ax.grid(alpha=0.25, ls='--')
+
     plt.tight_layout()
+
     save_plot(fig, save_name)
     plt.show()
 
